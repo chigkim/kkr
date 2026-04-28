@@ -1,4 +1,4 @@
-batch_size: 12
+batch_size: 4
 epochs: 10
 epochs_1st: 10
 epochs_2nd: 10
@@ -8,25 +8,25 @@ first_stage_path: "first_stage.pth"
 load_only_params: true
 second_stage_load_pretrained: false  # false = load from first_stage.pth (recommended)
 # ─────────────────────────────────────────────────────────────────────────────
-# Kokoro German Fine-Tuning Config
+# Kokoro American English Fine-Tuning Config
 # ─────────────────────────────────────────────────────────────────────────────
-# Based on StyleTTS2 config_ft.yml, adapted for:
+# Adapted for:
 # - Kokoro-82M architecture (ISTFTNet vocoder, no diffusion)
-# - German single-speaker fine-tuning (28h Daniel)
+# - Multi-speaker American English fine-tuning
 # - Conservative fine-tuning from pre-trained English checkpoint
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Logging ──────────────────────────────────────────────────────────────────
-log_dir: "logs/kokoro-deutsch"
+log_dir: "logs/kokoro-english"
 
 # ── Data ─────────────────────────────────────────────────────────────────────
 data_params:
   train_data: "../training/train_list.txt"
   val_data: "../training/val_list.txt"
-  root_path: "../dataset/audio"
+  root_path: ".."
   OOD_data: "../training/OOD_texts.txt"
   min_length: 50                    # min phoneme sequence length (chars)
-  num_workers:  24                  # CPU workers for data loading
+  num_workers: 4                    # CPU workers for data loading
 
 # ── Preprocessing ────────────────────────────────────────────────────────────
 preprocess_params:
@@ -47,7 +47,7 @@ model_params:
   hidden_dim: 512                   # model hidden dimension
   style_dim: 128                    # style/speaker embedding dimension (x2 = 256 total in voicepack)
   max_dur: 50                       # max duration per phoneme (in frames)
-  multispeaker: false               # single speaker fine-tuning
+  multispeaker: true                # ENABLED: supports multiple speakers in one dataset
   n_mels: 80                        # mel spectrogram bands
   dropout: 0.2
   n_layer: 3                        # number of layers in text encoder / predictor
@@ -116,28 +116,12 @@ optimizer_params:
   bert_lr: 0.00001                  # lower LR for PLBERT (mostly frozen knowledge)
   ft_lr: 0.0001                     # fine-tuning LR for acoustic modules
 
-# TODO: Remove this entire `training:` block — it is dead config.
-# Neither train_first.py nor train_second.py reads from config["training"].
-# All these values are read from the TOP LEVEL keys above.
-# See: https://github.com/semidark/kokoro-deutsch/issues/14
-training:
-  epochs: 10
-  batch_size: 4
-  save_freq: 2
-  log_interval: 10
-  eval_interval: 500
-  pretrained_model: "../training/kokoro_base.pth"
-  load_only_params: true
-  second_stage_load_pretrained: false
-
 # ── Pitch Extractor ──────────────────────────────────────────────────────────
 # StyleTTS2 uses JDC pitch extractor
-# If Utils/JDC/bst.t7 is not available, the training code falls back to other methods
 F0_path: "Utils/JDC/bst.t7"
 
 # ── ASR Alignment Model ─────────────────────────────────────────────────────
 # StyleTTS2's pre-trained alignment model (English)
-# May need to be adapted for German or set TMA_epoch=0 to learn from scratch
 ASR_config: "Utils/ASR/config.yml"
 ASR_path: "Utils/ASR/epoch_00080.pth"
 

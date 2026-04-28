@@ -49,7 +49,7 @@ Requirement:
 ## German G2P Notes
 
 - G2P backend: `misaki` + `espeak-ng`
-- German code path uses `espeak.EspeakG2P(language='de')`
+- Code path uses `espeak.EspeakG2P(language='en-us')`
 - Symbol `ʏ` is not in Kokoro vocab and must be normalized to `y`
 
 ## German Phoneme Compatibility

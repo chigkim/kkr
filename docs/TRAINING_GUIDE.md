@@ -64,7 +64,7 @@ German G2P example:
 ```python
 from misaki import espeak
 
-g2p = espeak.EspeakG2P(language='de')
+g2p = espeak.EspeakG2P(language='en-us')
 phonemes, _ = g2p(text)
 phonemes = phonemes.replace('ʏ', 'y')  # ʏ not in Kokoro vocab
 ```

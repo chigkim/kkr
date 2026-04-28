@@ -155,7 +155,7 @@ upstream `hexgrad/kokoro` repository.
 
 - **Sample rate:** 24000 Hz
 - **Max phoneme length:** 510 characters (inputs are chunked/truncated to fit)
-- **German G2P:** Uses `espeak.EspeakG2P(language='de')` from misaki, requires espeak-ng installed
+- **English G2P:** Uses `espeak.EspeakG2P(language='en-us')` from misaki, requires espeak-ng installed
 - **Voice files:** `.pt` files; shape `[510, 1, 256]` per voice (float32)
 - **Device selection:** Auto-detects CUDA > MPS > CPU; explicit device can be passed
 - **ONNX export:** Use `disable_complex=True` in `KModel` to use `CustomSTFT` instead of `TorchSTFT`

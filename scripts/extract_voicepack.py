@@ -37,8 +37,11 @@ Voicepack format: tensor of shape [510, 1, 256] (float32)
 
 import argparse
 import math
+import os
 import sys
 from pathlib import Path
+
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import torch
 import torch.nn as nn
@@ -196,10 +199,7 @@ def extract_voicepack(
 
     # ── Resolve device ───────────────────────────────────────────────────
     if device == "auto":
-        if torch.cuda.is_available():
-            device = "cuda"
-        else:
-            device = "cpu"
+        device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
     print(f"Using device: {device}")
 
     # ── Collect audio files ──────────────────────────────────────────────

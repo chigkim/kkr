@@ -159,35 +159,37 @@ def cmd_prepare():
     print(f"Wrote {TRAIN_LIST} ({len(train_entries):,} lines)")
     print(f"Wrote {VAL_LIST} ({len(val_entries):,} lines)")
 
-    # ── Write OOD texts (German sentences not in training) ───────────────
+    # ── Write OOD texts (English sentences not in training) ───────────────
     ood_sentences = [
-        "Die Bundesrepublik Deutschland ist ein demokratischer Staat.",
-        "Morgen wird es regnen, nehmen Sie einen Regenschirm mit.",
-        "Der schnelle braune Fuchs springt über den faulen Hund.",
-        "Können Sie mir bitte den Weg zum Bahnhof zeigen?",
-        "Die Kinder spielen fröhlich im Garten und lachen laut.",
-        "Wissenschaftler haben eine bahnbrechende Entdeckung gemacht.",
-        "Das Frühstück war ausgezeichnet, besonders die frischen Brötchen.",
-        "Im Schwarzwald gibt es viele schöne Wanderwege zu entdecken.",
-        "Die Universität bietet verschiedene Studiengänge für internationale Studenten an.",
-        "Bitte vergessen Sie nicht, die Tür abzuschließen, wenn Sie gehen.",
-        "Der Weihnachtsmarkt in Nürnberg ist weltberühmt für seinen Glühwein.",
-        "Diese Aufgabe erfordert besondere Sorgfalt und Aufmerksamkeit.",
-        "Die Zugverbindung zwischen München und Berlin dauert etwa vier Stunden.",
-        "Könnten Sie mir erklären, wie dieses Gerät funktioniert?",
-        "Das Unternehmen hat im vergangenen Quartal einen Rekordgewinn erzielt.",
-        "Die Bibliothek hat montags bis freitags von acht bis zwanzig Uhr geöffnet.",
-        "Entschuldigen Sie die Verspätung, der Verkehr war heute besonders schlimm.",
-        "Die neue Brücke über den Rhein wird nächstes Jahr fertiggestellt.",
-        "Haben Sie schon einmal die Berliner Philharmoniker live gehört?",
-        "Der Arzt empfiehlt, täglich mindestens dreißig Minuten spazieren zu gehen.",
+        "The quick brown fox jumps over the lazy dog.",
+        "Please call Stella and ask her to bring these things with her from the store.",
+        "The small plastic snack and a big toy frog are for the kids.",
+        "She can scoop these things into three red bags and we will go meet her Wednesday.",
+        "When the sunlight strikes raindrops in the air, they act as a prism and form a rainbow.",
+        "The rainbow is a division of white light into many beautiful colors.",
+        "These take the shape of a long round arch, with its path high above.",
+        "There is, according to legend, a boiling pot of gold at one end.",
+        "People look, but no one ever finds it.",
+        "When a man looks for something beyond his reach, his friends say he is looking for the pot of gold.",
+        "The scientists have made a breakthrough discovery in the field of medicine.",
+        "The university offers various courses for international students.",
+        "Please do not forget to lock the door when you leave the house.",
+        "The connection between the two cities takes about four hours by train.",
+        "Could you please explain to me how this device works?",
+        "The company achieved a record profit in the last quarter.",
+        "The library is open from Monday to Friday from eight to eight.",
+        "I am sorry for being late, the traffic was particularly bad today.",
+        "The new bridge over the river will be completed next year.",
+        "Have you ever heard the symphony orchestra play live?",
     ]
 
     # Convert OOD texts to IPA phonemes
     try:
+        from espeak_compat import configure_espeak
+        configure_espeak()
         from misaki import espeak
 
-        g2p = espeak.EspeakG2P(language="de")
+        g2p = espeak.EspeakG2P(language="en-us")
         ood_phonemes = []
         for text in ood_sentences:
             try:

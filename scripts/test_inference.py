@@ -24,8 +24,11 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 # Prefer the kokoro submodule over any pip-installed kokoro package
 _repo_root = Path(__file__).resolve().parents[1]
@@ -34,7 +37,7 @@ if _kokoro_submodule.exists() and str(_kokoro_submodule) not in sys.path:
     sys.path.insert(0, str(_kokoro_submodule))
 
 # Standard German phonetic test set — covers all major pronunciation challenges
-TEST_SENTENCES = [
+GERMAN_TEST_SENTENCES = [
     # 1. Umlauts (ä, ö, ü) and sch
     "Schön, dass du da bist. Die Bücher liegen auf dem großen Tisch.",
     # 2. Ich-Laut vs Ach-Laut (ç vs x)
@@ -49,6 +52,17 @@ TEST_SENTENCES = [
     "Warum hast du das getan? Das ist ja unglaublich!",
     # 7. Numbers
     "Das kostet genau einhundertdreiundzwanzig Millionen Euro.",
+]
+
+# Standard American English test set
+ENGLISH_TEST_SENTENCES = [
+    "The birch canoe slid on the smooth planks.",
+    "Glue the sheet to the dark blue background.",
+    "It's easy to tell the depth of a well.",
+    "These days a chicken leg is a rare dish.",
+    "Rice is often served in round bowls.",
+    "The box was thrown beside the parked truck.",
+    "The boy was amazed by the huge whale.",
 ]
 
 
@@ -98,16 +112,18 @@ def run_inference(
     voicepack_path: str,
     config_path: str,
     output_dir: str,
+    lang_code: str = "a",
     device: str = "auto",
 ):
-    """Run inference on the German test set."""
+    """Run inference on the test set."""
     import torch
     import soundfile as sf
     from kokoro import KModel, KPipeline
 
     if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
     print(f"Using device: {device}")
+    print(f"Language code: {lang_code}")
 
     # Load model with our fine-tuned weights and config
     print(f"Loading model from: {model_path}")
@@ -115,8 +131,8 @@ def run_inference(
     kmodel = KModel(repo_id="hexgrad/Kokoro-82M", config=config_path, model=model_path)
     kmodel = kmodel.to(device).eval()
 
-    # Create pipeline with German lang_code
-    pipeline = KPipeline(lang_code="d", repo_id="hexgrad/Kokoro-82M", model=kmodel)
+    # Create pipeline with specified lang_code
+    pipeline = KPipeline(lang_code=lang_code, repo_id="hexgrad/Kokoro-82M", model=kmodel)
 
     # Load voicepack
     print(f"Loading voicepack: {voicepack_path}")
@@ -126,10 +142,15 @@ def run_inference(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
+    # Select sentences based on lang_code
+    test_sentences = (
+        ENGLISH_TEST_SENTENCES if lang_code in ["a", "b"] else GERMAN_TEST_SENTENCES
+    )
+
     # Generate audio for each test sentence
-    print(f"\nGenerating {len(TEST_SENTENCES)} test sentences...\n")
-    for i, text in enumerate(TEST_SENTENCES):
-        print(f"[{i + 1}/{len(TEST_SENTENCES)}] {text[:60]}...")
+    print(f"\nGenerating {len(test_sentences)} test sentences...\n")
+    for i, text in enumerate(test_sentences):
+        print(f"[{i + 1}/{len(test_sentences)}] {text[:60]}...")
         try:
             generator = pipeline(text, voice=voice, speed=1)
             all_audio = []
@@ -155,7 +176,7 @@ def run_inference(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Test fine-tuned Kokoro German model",
+        description="Test fine-tuned Kokoro model",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     group = parser.add_mutually_exclusive_group(required=True)
@@ -171,6 +192,11 @@ def main():
         "--voicepack",
         required=True,
         help="Path to voicepack (.pt)",
+    )
+    parser.add_argument(
+        "--lang-code",
+        default="a",
+        help="Language code: a (American English), d (German), etc. (default: a)",
     )
     parser.add_argument(
         "--config",
@@ -195,7 +221,7 @@ def main():
     if args.checkpoint:
         model_path = convert_checkpoint(
             args.checkpoint,
-            str(Path(args.output_dir) / "kokoro_german_converted.pth"),
+            str(Path(args.output_dir) / "kokoro_converted.pth"),
         )
     else:
         model_path = args.model
@@ -205,8 +231,10 @@ def main():
         voicepack_path=args.voicepack,
         config_path=args.config,
         output_dir=args.output_dir,
+        lang_code=args.lang_code,
         device=args.device,
     )
+
 
 
 if __name__ == "__main__":

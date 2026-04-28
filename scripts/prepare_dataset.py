@@ -536,10 +536,12 @@ def cmd_format(rename_speakers: list[str] | None):
     print(f"Converted: {converted}  Skipped (exists): {skipped}  Errors: {errors}")
 
     # Generate IPA phonemes
-    print("Generating IPA phonemes via misaki (espeak-ng German G2P)...")
+    print("Generating IPA phonemes via misaki (espeak-ng en-us G2P)...")
+    from espeak_compat import configure_espeak
+    configure_espeak()
     from misaki import espeak
 
-    g2p = espeak.EspeakG2P(language="de")
+    g2p = espeak.EspeakG2P(language="en-us")
 
     # Phoneme fixup: ʏ (U+028F, short ü) is not in Kokoro's 178-token vocab.
     # Map it to y (U+0079, long ü) — the duration difference is learned from audio.
