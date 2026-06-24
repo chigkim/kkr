@@ -1,3 +1,5 @@
+dataset: "dataset"
+name: "vctk"
 batch_size: 4
 epochs: 10
 epochs_1st: 30
@@ -12,10 +14,6 @@ best_second_stage_path: "best_2nd.pth"
 load_only_params: true
 second_stage_load_pretrained: false  # false = load from first_stage.pth (recommended)
 log_dir: "logs/kokoro-vctk"
-# Processed dataset folder created by:
-#   uv run python prepare_dataset.py /path/to/raw-dataset -o /path/to/processed-dataset
-# CLI --dataset overrides this when provided.
-# dataset: "/path/to/processed-dataset"
 
 data_params:
   min_length: 50                    # min phoneme sequence length (chars)

@@ -117,7 +117,6 @@ def _apply_processed_dataset(config, dataset):
         dataset_dir = REPO_ROOT / dataset_dir
     dataset_dir = dataset_dir.resolve()
 
-    config['log_dir'] = str(dataset_dir / 'logs')
     data_params = config.setdefault('data_params', {})
     data_params['train_data'] = str(dataset_dir / 'train.txt')
     data_params['val_data'] = str(dataset_dir / 'val.txt')
@@ -135,8 +134,19 @@ def _apply_processed_dataset(config, dataset):
         config.setdefault('text_params', {})['symbols_path'] = str(symbols_path)
 
 
-def _resolve_runtime_paths(config, config_path, dataset=None):
+def _apply_name(config, name):
+    name = name or config.get('name')
+    if not name:
+        return
+    run_dir = Path(name)
+    if not run_dir.is_absolute():
+        run_dir = REPO_ROOT / 'runs' / run_dir
+    config['log_dir'] = str(run_dir.resolve())
+
+
+def _resolve_runtime_paths(config, config_path, dataset=None, name=None):
     _apply_processed_dataset(config, dataset or config.get('dataset'))
+    _apply_name(config, name)
     config_dir = Path(config_path).resolve().parent
     if config.get('log_dir'):
         config['log_dir'] = _resolve_path(config['log_dir'], REPO_ROOT)
@@ -154,15 +164,16 @@ def _resolve_runtime_paths(config, config_path, dataset=None):
 @click.command()
 @click.option("-p", "--config_path", default="Configs/config.yml", type=str)
 @click.option('--dataset', type=str, default=None, help='Processed dataset directory from prepare_dataset.py')
+@click.option('-name', '-n', '--name', type=str, default=None, help='Run/output name; saves checkpoints and logs under runs/<name>')
 @click.option(
     "--resume",
     is_flag=True,
     help="Resume from the latest epoch_1st_*.pth checkpoint in log_dir.",
 )
-def main(config_path, dataset, resume):
+def main(config_path, dataset, name, resume):
     config_path = str((REPO_ROOT / config_path).resolve()) if not osp.isabs(config_path) else config_path
     config = yaml.safe_load(open(config_path))
-    _resolve_runtime_paths(config, config_path, dataset)
+    _resolve_runtime_paths(config, config_path, dataset, name)
     symbols_config = apply_symbols_config(config, config_path)
     if symbols_config:
         print(f'Using symbols: {symbols_config[0]} ({symbols_config[1]} tokens)')
