@@ -26,6 +26,14 @@ dataset/
 # ── Training data lists (derived from non-redistributable dataset) ──────────
 training/train_list.txt
 training/val_list.txt
+training/vctk_*.txt
+training/vctk_speakers.json
+training/symbols.json
+training/manifest.json
+training/speakers.json
+training/train.txt
+training/val.txt
+training/OOD.txt
 
 # ── Training artifacts (large binary files) ─────────────────────────────────
 training/kokoro_base.pth
@@ -37,9 +45,15 @@ StyleTTS2/logs/
 
 # ── Test output (generated WAVs and converted models) ───────────────────────
 test_output/
+generated/
+test/
+af/
 
 # ── Voicepacks (derived from non-redistributable data) ─────────────────────
 voices/*.pt
+voices/vctk_samples/
+voices/vctk_stage1/
+voices/vctk_best_stage1/
 
 # ── Backup and temp files ───────────────────────────────────────────────────
 *.bak
