@@ -1,7 +1,14 @@
 # load packages
 import os
+import sys
+from pathlib import Path
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+REPO_ROOT = Path(__file__).resolve().parent
+STYLETTS2_ROOT = REPO_ROOT / 'StyleTTS2'
+if str(STYLETTS2_ROOT) not in sys.path:
+    sys.path.insert(0, str(STYLETTS2_ROOT))
 
 import copy
 import random
@@ -105,6 +112,22 @@ def prune_checkpoints(log_dir, pattern, keep_last, keep_paths=None):
             os.remove(path)
 
 
+def _styletts2_path(path):
+    if not path or osp.isabs(str(path)):
+        return path
+    return str((STYLETTS2_ROOT / path).resolve())
+
+
+def _resolve_runtime_paths(config):
+    for key in ["log_dir", "pretrained_model", "ASR_config", "ASR_path", "F0_path", "PLBERT_dir"]:
+        if key in config and config[key]:
+            config[key] = _styletts2_path(config[key])
+    data_params = config.get("data_params") or {}
+    for key in ["train_data", "val_data", "root_path", "OOD_data"]:
+        if key in data_params and data_params[key]:
+            data_params[key] = _styletts2_path(data_params[key])
+
+
 @click.command()
 @click.option("-p", "--config_path", default="Configs/config.yml", type=str)
 @click.option(
@@ -113,7 +136,9 @@ def prune_checkpoints(log_dir, pattern, keep_last, keep_paths=None):
     help="Resume from the latest epoch_2nd_*.pth checkpoint in log_dir.",
 )
 def main(config_path, resume):
+    config_path = str((REPO_ROOT / config_path).resolve()) if not osp.isabs(config_path) else config_path
     config = yaml.safe_load(open(config_path))
+    _resolve_runtime_paths(config)
     symbols_config = apply_symbols_config(config, config_path)
     if symbols_config:
         print(f'Using symbols: {symbols_config[0]} ({symbols_config[1]} tokens)')
