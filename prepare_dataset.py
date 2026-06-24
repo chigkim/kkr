@@ -76,16 +76,12 @@ def discover_rows(dataset_root: Path, extensions):
 def main():
     parser = argparse.ArgumentParser(description='Prepare multilingual lang/speaker wav+txt dataset for StyleTTS2 training')
     parser.add_argument('dataset', type=Path, help='Root with layout lang-code/speaker/*.wav + *.txt')
-    parser.add_argument('--name', '--run-name', dest='run_name', help='Run name; writes outputs to runs/<name>/')
-    parser.add_argument('--out-dir', type=Path, default=None)
+    parser.add_argument('-o', '--out-dir', type=Path, default=Path('training'), help='Processed dataset output directory')
     parser.add_argument('--val-ratio', type=float, default=VAL_RATIO)
     parser.add_argument('--seed', type=int, default=RANDOM_SEED)
     parser.add_argument('--limit', type=int, default=None)
     parser.add_argument('--extensions', default='.wav', help='Comma-separated audio extensions, e.g. .wav,.flac')
     args = parser.parse_args()
-
-    if args.out_dir is None:
-        args.out_dir = Path('runs') / args.run_name if args.run_name else Path('training')
 
     extensions = {ext.strip().lower() for ext in args.extensions.split(',') if ext.strip()}
     rows = discover_rows(args.dataset, extensions)
@@ -160,7 +156,7 @@ def main():
     with open(manifest_path, 'w', encoding='utf-8') as f:
         json.dump({
             'dataset': str(args.dataset),
-            'run_name': args.run_name,
+            'processed_dataset': str(args.out_dir),
             'g2p_backend': 'phonemizer',
             'languages': sorted({r['language'] for r in rows}),
             'speakers': speakers,

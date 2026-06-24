@@ -24,9 +24,8 @@ second_stage_load_pretrained: false  # false = load from first_stage.pth (recomm
 log_dir: "logs/kokoro-vctk"
 
 # ── Text / Vocabulary ───────────────────────────────────────────────────────
-# Uncomment for datasets prepared by scripts/prepare_dataset.py. The training
-# scripts will load this file, set model_params.n_token automatically, and
-# expand compatible checkpoint/PLBERT embeddings for appended symbols.
+# Normally this is set automatically when passing --dataset to train_first.py /
+# train_second.py. Uncomment only when driving paths entirely from this config.
 # text_params:
 #   symbols_path: "../training/symbols.json"
 
