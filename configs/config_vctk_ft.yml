@@ -13,7 +13,6 @@ best_first_stage_path: "best_1st.pth"
 best_second_stage_path: "best_2nd.pth"
 load_only_params: true
 second_stage_load_pretrained: false  # false = load from first_stage.pth (recommended)
-log_dir: "logs/kokoro-vctk"
 
 data_params:
   min_length: 50                    # min phoneme sequence length (chars)

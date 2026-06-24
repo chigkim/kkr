@@ -143,10 +143,11 @@ def _apply_processed_dataset(config, dataset):
         config.setdefault('text_params', {})['symbols_path'] = str(symbols_path)
 
 
-def _apply_name(config, name):
+def _apply_name(config, name, dataset):
     name = name or config.get('name')
     if not name:
-        return
+        dataset_path = dataset or config.get('dataset')
+        name = Path(dataset_path).name if dataset_path else 'default'
     run_dir = Path(name)
     if not run_dir.is_absolute():
         run_dir = REPO_ROOT / 'runs' / run_dir
@@ -154,11 +155,10 @@ def _apply_name(config, name):
 
 
 def _resolve_runtime_paths(config, config_path, dataset=None, name=None):
-    _apply_processed_dataset(config, dataset or config.get('dataset'))
-    _apply_name(config, name)
+    dataset = dataset or config.get('dataset')
+    _apply_processed_dataset(config, dataset)
+    _apply_name(config, name, dataset)
     config_dir = Path(config_path).resolve().parent
-    if config.get('log_dir'):
-        config['log_dir'] = _resolve_path(config['log_dir'], REPO_ROOT)
     if config.get('pretrained_model'):
         config['pretrained_model'] = _resolve_path(config['pretrained_model'], config_dir)
     for key in ['ASR_config', 'ASR_path', 'F0_path', 'PLBERT_dir']:
