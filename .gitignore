@@ -7,9 +7,19 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.egg-info/
+.eggs/
 dist/
 build/
+develop-eggs/
+downloads/
+eggs/
+parts/
+sdist/
+wheels/
 *.egg
+.installed.cfg
+MANIFEST
+*.so
 
 # ── Virtual environments ────────────────────────────────────────────────────
 .venv/
@@ -19,6 +29,16 @@ env/
 # ── Linter / tool caches ───────────────────────────────────────────────────
 .ruff_cache/
 .mypy_cache/
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+.hypothesis/
+.pyre/
+.pytype/
 
 # ── Dataset (not redistributable — see README) ─────────────────────────────
 dataset/
@@ -42,6 +62,7 @@ training/f0/
 
 # ── Training checkpoints and logs ───────────────────────────────────────────
 StyleTTS2/logs/
+StyleTTS2/Models/
 
 # ── Test output (generated WAVs and converted models) ───────────────────────
 test_output/
@@ -62,11 +83,18 @@ voices/vctk_best_stage1/
 *.swp
 *.swo
 *~
+*.log
+pip-log.txt
+pip-delete-this-directory.txt
 
 # ── Editor / IDE ────────────────────────────────────────────────────────────
 .idea/
 .vscode/
 *.code-workspace
+.ipynb_checkpoints/
+.spyderproject
+.spyproject
+.ropeproject
 
 # ── OS ──────────────────────────────────────────────────────────────────────
 .DS_Store
