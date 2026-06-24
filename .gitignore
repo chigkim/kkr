@@ -67,6 +67,7 @@ StyleTTS2/Models/
 # ── Test output (generated WAVs and converted models) ───────────────────────
 test_output/
 generated/
+runs/
 test/
 af/
 

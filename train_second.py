@@ -118,7 +118,36 @@ def _resolve_path(path, base):
     return str((base / path).resolve())
 
 
+def _apply_run_name(config):
+    run_name = config.get('run_name')
+    if not run_name:
+        return
+    run_dir = Path(config.get('run_dir') or Path('runs') / run_name)
+    if not run_dir.is_absolute():
+        run_dir = REPO_ROOT / run_dir
+    run_dir = run_dir.resolve()
+    config['run_dir'] = str(run_dir)
+    config['log_dir'] = str(run_dir / 'logs')
+
+    data_params = config.setdefault('data_params', {})
+    data_params.setdefault('train_data', str(run_dir / 'train.txt'))
+    data_params.setdefault('val_data', str(run_dir / 'val.txt'))
+    data_params.setdefault('OOD_data', str(run_dir / 'OOD.txt'))
+
+    manifest_path = run_dir / 'manifest.json'
+    if not data_params.get('root_path') and manifest_path.exists():
+        with open(manifest_path, encoding='utf-8') as f:
+            manifest = yaml.safe_load(f)
+        data_params['root_path'] = manifest.get('dataset')
+
+    symbols_path = run_dir / 'symbols.json'
+    if symbols_path.exists():
+        text_params = config.setdefault('text_params', {})
+        text_params.setdefault('symbols_path', str(symbols_path))
+
+
 def _resolve_runtime_paths(config, config_path):
+    _apply_run_name(config)
     config_dir = Path(config_path).resolve().parent
     if config.get('log_dir'):
         config['log_dir'] = _resolve_path(config['log_dir'], REPO_ROOT)
