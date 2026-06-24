@@ -5,40 +5,22 @@ epochs_2nd: 10
 save_freq: 1
 keep_last_checkpoints: 2
 tensorboard_baseline_samples: 0
-pretrained_model: "../training/kokoro_base.pth"
+pretrained_model: "training/kokoro_base.pth"
 first_stage_path: "first_stage.pth"
 best_first_stage_path: "best_1st.pth"
 best_second_stage_path: "best_2nd.pth"
 load_only_params: true
 second_stage_load_pretrained: false  # false = load from first_stage.pth (recommended)
-# ─────────────────────────────────────────────────────────────────────────────
-# Kokoro American English Fine-Tuning Config
-# ─────────────────────────────────────────────────────────────────────────────
-# Adapted for:
-# - Kokoro-82M architecture (ISTFTNet vocoder, no diffusion)
-# - Multi-speaker American English fine-tuning
-# - Conservative fine-tuning from pre-trained English checkpoint
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ── Logging ──────────────────────────────────────────────────────────────────
 log_dir: "logs/kokoro-vctk"
+# Processed dataset folder created by:
+#   uv run python prepare_dataset.py /path/to/raw-dataset -o /path/to/processed-dataset
+# CLI --dataset overrides this when provided.
+# dataset: "/path/to/processed-dataset"
 
-# ── Text / Vocabulary ───────────────────────────────────────────────────────
-# Normally this is set automatically when passing --dataset to train_first.py /
-# train_second.py. Uncomment only when driving paths entirely from this config.
-# text_params:
-#   symbols_path: "../training/symbols.json"
-
-# ── Data ─────────────────────────────────────────────────────────────────────
 data_params:
-  train_data: "../training/vctk_train_list.txt"
-  val_data: "../training/vctk_val_list.txt"
-  root_path: "../../voices/vckt-24k"
-  OOD_data: "../training/vctk_OOD_texts.txt"
   min_length: 50                    # min phoneme sequence length (chars)
   num_workers: 4                    # CPU workers for data loading
 
-# ── Preprocessing ────────────────────────────────────────────────────────────
 preprocess_params:
   sr: 24000
   spect_params:
@@ -49,8 +31,6 @@ preprocess_params:
     fmin: 0
     fmax: 8000
 
-# ── Model Architecture ──────────────────────────────────────────────────────
-# Must match Kokoro-82M exactly to load pre-trained weights
 model_params:
   dim_in: 64
   n_token: 178                      # phoneme vocabulary size (IPA + punctuation)
@@ -120,7 +100,6 @@ loss_params:
   diff_epoch: 999                   # effectively disable diffusion training
   joint_epoch: 3                    # start SLM joint training
 
-# ── Optimizer ────────────────────────────────────────────────────────────────
 optimizer_params:
   lr: 0.0001                        # main learning rate
   bert_lr: 0.00001                  # lower LR for PLBERT (mostly frozen knowledge)

@@ -136,7 +136,7 @@ def _apply_processed_dataset(config, dataset):
 
 
 def _resolve_runtime_paths(config, config_path, dataset=None):
-    _apply_processed_dataset(config, dataset)
+    _apply_processed_dataset(config, dataset or config.get('dataset'))
     config_dir = Path(config_path).resolve().parent
     if config.get('log_dir'):
         config['log_dir'] = _resolve_path(config['log_dir'], REPO_ROOT)
