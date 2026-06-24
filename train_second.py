@@ -112,20 +112,25 @@ def prune_checkpoints(log_dir, pattern, keep_last, keep_paths=None):
             os.remove(path)
 
 
-def _styletts2_path(path):
+def _resolve_path(path, base):
     if not path or osp.isabs(str(path)):
         return path
-    return str((STYLETTS2_ROOT / path).resolve())
+    return str((base / path).resolve())
 
 
-def _resolve_runtime_paths(config):
-    for key in ["log_dir", "pretrained_model", "ASR_config", "ASR_path", "F0_path", "PLBERT_dir"]:
+def _resolve_runtime_paths(config, config_path):
+    config_dir = Path(config_path).resolve().parent
+    if config.get('log_dir'):
+        config['log_dir'] = _resolve_path(config['log_dir'], REPO_ROOT)
+    if config.get('pretrained_model'):
+        config['pretrained_model'] = _resolve_path(config['pretrained_model'], config_dir)
+    for key in ['ASR_config', 'ASR_path', 'F0_path', 'PLBERT_dir']:
         if key in config and config[key]:
-            config[key] = _styletts2_path(config[key])
-    data_params = config.get("data_params") or {}
-    for key in ["train_data", "val_data", "root_path", "OOD_data"]:
+            config[key] = _resolve_path(config[key], STYLETTS2_ROOT)
+    data_params = config.get('data_params') or {}
+    for key in ['train_data', 'val_data', 'root_path', 'OOD_data']:
         if key in data_params and data_params[key]:
-            data_params[key] = _styletts2_path(data_params[key])
+            data_params[key] = _resolve_path(data_params[key], config_dir)
 
 
 @click.command()
@@ -138,7 +143,7 @@ def _resolve_runtime_paths(config):
 def main(config_path, resume):
     config_path = str((REPO_ROOT / config_path).resolve()) if not osp.isabs(config_path) else config_path
     config = yaml.safe_load(open(config_path))
-    _resolve_runtime_paths(config)
+    _resolve_runtime_paths(config, config_path)
     symbols_config = apply_symbols_config(config, config_path)
     if symbols_config:
         print(f'Using symbols: {symbols_config[0]} ({symbols_config[1]} tokens)')
