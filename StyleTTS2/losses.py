@@ -154,8 +154,8 @@ class GeneratorLoss(torch.nn.Module):
         self.msd = msd
         
     def forward(self, y, y_hat):
-        y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self.mpd(y, y_hat)
-        y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self.msd(y, y_hat)
+        y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self.mpd(y, y_hat, real_no_grad=True)
+        y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self.msd(y, y_hat, real_no_grad=True)
         loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
         loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
         loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
@@ -195,8 +195,18 @@ class WavLMLoss(torch.nn.Module):
     def __init__(self, model, wd, model_sr, slm_sr=16000):
         super(WavLMLoss, self).__init__()
         self.wavlm = AutoModel.from_pretrained(model)
+        # WavLM is used as a fixed perceptual feature extractor / SLM critic.
+        # Freeze its weights to avoid parameter gradients and keep dropout disabled,
+        # while still allowing gradients to flow through WavLM operations to y_rec.
+        self.wavlm.requires_grad_(False)
+        self.wavlm.eval()
         self.wd = wd
         self.resample = torchaudio.transforms.Resample(model_sr, slm_sr)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.wavlm.eval()
+        return self
 
     def forward(self, wav, y_rec):
         if wav.ndim == 3:
@@ -204,6 +214,7 @@ class WavLMLoss(torch.nn.Module):
         if y_rec.ndim == 3:
             y_rec = y_rec.squeeze(1)
 
+        self.wavlm.eval()
         with torch.no_grad():
             wav_16 = self.resample(wav)
             wav_embeddings = self.wavlm(input_values=wav_16, output_hidden_states=True).hidden_states
@@ -219,6 +230,7 @@ class WavLMLoss(torch.nn.Module):
     def generator(self, y_rec):
         if y_rec.ndim == 3:
             y_rec = y_rec.squeeze(1)
+        self.wavlm.eval()
         y_rec_16 = self.resample(y_rec)
         y_rec_embeddings = self.wavlm(input_values=y_rec_16, output_hidden_states=True).hidden_states
         y_rec_embeddings = torch.stack(y_rec_embeddings, dim=1).transpose(-1, -2).flatten(start_dim=1, end_dim=2)
@@ -233,6 +245,7 @@ class WavLMLoss(torch.nn.Module):
         if y_rec.ndim == 3:
             y_rec = y_rec.squeeze(1)
 
+        self.wavlm.eval()
         with torch.no_grad():
             wav_16 = self.resample(wav)
             wav_embeddings = self.wavlm(input_values=wav_16, output_hidden_states=True).hidden_states
@@ -257,6 +270,7 @@ class WavLMLoss(torch.nn.Module):
     def discriminator_forward(self, wav):
         if wav.ndim == 3:
             wav = wav.squeeze(1)
+        self.wavlm.eval()
         with torch.no_grad():
             wav_16 = self.resample(wav)
             wav_embeddings = self.wavlm(input_values=wav_16, output_hidden_states=True).hidden_states

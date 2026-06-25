@@ -82,6 +82,8 @@ def main():
     parser.add_argument('--limit', type=int, default=None)
     parser.add_argument('--extensions', default='.wav', help='Comma-separated audio extensions, e.g. .wav,.flac')
     args = parser.parse_args()
+    args.dataset = args.dataset.resolve()
+    args.out_dir = args.out_dir.resolve()
 
     extensions = {ext.strip().lower() for ext in args.extensions.split(',') if ext.strip()}
     rows = discover_rows(args.dataset, extensions)

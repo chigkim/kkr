@@ -42,6 +42,7 @@ from meldataset import build_dataloader
 from kokoro_symbols import TextCleaner
 from symbols_config import apply_symbols_config
 from kokoro_tb_utils import prepare_test_tokens, extract_voicepack, run_kokoro_inference
+from speaker_losses import SpeakerClassifier, SpeakerCenters, speaker_separation_loss
 
 from Utils.ASR.models import ASRCNN
 from Utils.JDC.model import JDCNet
@@ -136,7 +137,8 @@ def _apply_processed_dataset(config, dataset):
         with open(manifest_path, encoding='utf-8') as f:
             manifest = yaml.safe_load(f)
         if manifest.get('dataset'):
-            data_params['root_path'] = manifest['dataset']
+            root_path = Path(manifest['dataset'])
+            data_params['root_path'] = str(root_path if root_path.is_absolute() else (REPO_ROOT / root_path).resolve())
 
     symbols_path = dataset_dir / 'symbols.json'
     if symbols_path.exists():
@@ -160,7 +162,7 @@ def _resolve_runtime_paths(config, config_path, dataset=None, name=None):
     _apply_name(config, name, dataset)
     config_dir = Path(config_path).resolve().parent
     if config.get('pretrained_model'):
-        config['pretrained_model'] = _resolve_path(config['pretrained_model'], config_dir)
+        config['pretrained_model'] = _resolve_path(config['pretrained_model'], REPO_ROOT)
     for key in ['ASR_config', 'ASR_path', 'F0_path', 'PLBERT_dir']:
         if key in config and config[key]:
             config[key] = _resolve_path(config[key], STYLETTS2_ROOT)
@@ -168,6 +170,16 @@ def _resolve_runtime_paths(config, config_path, dataset=None, name=None):
     for key in ['train_data', 'val_data', 'root_path', 'OOD_data']:
         if key in data_params and data_params[key]:
             data_params[key] = _resolve_path(data_params[key], config_dir)
+
+
+def _num_speakers_from_lists(*lists):
+    speaker_ids = []
+    for data_list in lists:
+        for line in data_list:
+            parts = line.strip().split('|')
+            if len(parts) >= 3:
+                speaker_ids.append(int(parts[2]))
+    return max(speaker_ids) + 1 if speaker_ids else 1
 
 
 @click.command()
@@ -274,7 +286,10 @@ def main(config_path, dataset, name, resume):
     # build model
     model_params = recursive_munch(config["model_params"])
     multispeaker = model_params.multispeaker
-    model = build_model(model_params, text_aligner, pitch_extractor, plbert)
+    diffusion_enabled = loss_params.get('lambda_diff', 0) > 0 and diff_epoch < epochs
+    model = build_model(model_params, text_aligner, pitch_extractor, plbert, enable_diffusion=diffusion_enabled)
+    if not diffusion_enabled:
+        logger.info('Diffusion model disabled; skipping diffusion module allocation')
     _ = [model[key].to(device) for key in model]
 
     start_epoch = 0
@@ -327,6 +342,19 @@ def main(config_path, dataset, name, resume):
         else:
             raise ValueError("You need to specify the path to the first stage model.")
 
+    num_speakers = int(config.get('num_speakers') or _num_speakers_from_lists(train_list, val_list))
+    style_dim = int(config['model_params'].get('style_dim', 128))
+    if loss_params.get('lambda_prosody_spk', 0) > 0:
+        model['prosody_speaker_classifier'] = SpeakerClassifier(style_dim, num_speakers)
+    if loss_params.get('lambda_prosody_center', 0) > 0 or loss_params.get('lambda_speaker_margin', 0) > 0:
+        model['prosody_speaker_centers'] = SpeakerCenters(num_speakers, style_dim)
+    if 'prosody_speaker_classifier' in model:
+        model['prosody_speaker_classifier'].to(device)
+    if 'prosody_speaker_centers' in model:
+        model['prosody_speaker_centers'].to(device)
+    if 'prosody_speaker_classifier' in model or 'prosody_speaker_centers' in model:
+        logger.info(f'Enabled prosody speaker separation loss for {num_speakers} speakers')
+
     gl = GeneratorLoss(model.mpd, model.msd).to(device)
     dl = DiscriminatorLoss(model.mpd, model.msd).to(device)
     wl = WavLMLoss(model_params.slm.model, model.wd, sr, model_params.slm.sr).to(device)
@@ -336,14 +364,16 @@ def main(config_path, dataset, name, resume):
         dl = MyDataParallel(dl)
         wl = MyDataParallel(wl)
 
-    sampler = DiffusionSampler(
-        model.diffusion.diffusion,
-        sampler=ADPM2Sampler(),
-        sigma_schedule=KarrasSchedule(
-            sigma_min=0.0001, sigma_max=3.0, rho=9.0
-        ),  # empirical parameters
-        clamp=False,
-    )
+    sampler = None
+    if diffusion_enabled:
+        sampler = DiffusionSampler(
+            model.diffusion.diffusion,
+            sampler=ADPM2Sampler(),
+            sigma_schedule=KarrasSchedule(
+                sigma_min=0.0001, sigma_max=3.0, rho=9.0
+            ),  # empirical parameters
+            clamp=False,
+        )
 
     scheduler_params = {
         "max_lr": optimizer_params.lr,
@@ -355,6 +385,10 @@ def main(config_path, dataset, name, resume):
     scheduler_params_dict["bert"]["max_lr"] = optimizer_params.bert_lr * 2
     scheduler_params_dict["decoder"]["max_lr"] = optimizer_params.ft_lr * 2
     scheduler_params_dict["style_encoder"]["max_lr"] = optimizer_params.ft_lr * 2
+    if "prosody_speaker_classifier" in scheduler_params_dict:
+        scheduler_params_dict["prosody_speaker_classifier"]["max_lr"] = optimizer_params.ft_lr * 2
+    if "prosody_speaker_centers" in scheduler_params_dict:
+        scheduler_params_dict["prosody_speaker_centers"]["max_lr"] = optimizer_params.ft_lr * 2
 
     optimizer = build_optimizer(
         {key: model[key].parameters() for key in model},
@@ -442,7 +476,7 @@ def main(config_path, dataset, name, resume):
         batch_percentage=slmadv_params.batch_percentage,
         skip_update=slmadv_params.iter,
         sig=slmadv_params.sig,
-        diffusion_enabled=(diff_epoch < epochs),
+        diffusion_enabled=diffusion_enabled,
     )
 
     # ── Kokoro-faithful TensorBoard inference setup ───────────────────────────
@@ -488,6 +522,8 @@ def main(config_path, dataset, name, resume):
     # ─────────────────────────────────────────────────────────────────────────
 
     for epoch in range(start_epoch, epochs):
+        if device == "mps":
+            torch.mps.empty_cache()
         running_loss = 0
         start_time = time.time()
 
@@ -500,7 +536,9 @@ def main(config_path, dataset, name, resume):
 
         for i, batch in enumerate(train_dataloader):
             waves = batch[0]
-            batch = [b.to(device) for b in batch[1:]]
+            labels = batch[-2].to(device)
+            ref_labels = batch[-1].to(device)
+            batch = [b.to(device) for b in batch[1:-2]]
             (
                 texts,
                 input_lengths,
@@ -594,7 +632,7 @@ def main(config_path, dataset, name, resume):
                 sys.exit(1)
 
             # denoiser training
-            if epoch >= diff_epoch:
+            if diffusion_enabled and epoch >= diff_epoch:
                 num_steps = np.random.randint(3, 5)
 
                 if model_params.diffusion.dist.estimate_sigma_data:
@@ -683,11 +721,22 @@ def main(config_path, dataset, name, resume):
             if gt.size(-1) < 80:
                 continue
 
-            F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
+            with torch.no_grad():
+                F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
             N_real = log_norm(gt.unsqueeze(1)).squeeze(1)
 
             s_dur = model.predictor_encoder(
                 st.unsqueeze(1) if multispeaker else gt.unsqueeze(1)
+            )
+            prosody_spk_loss, prosody_spk_ce, prosody_center_loss, prosody_margin_loss = speaker_separation_loss(
+                s_dur,
+                ref_labels if multispeaker else labels,
+                classifier=model.get('prosody_speaker_classifier'),
+                centers=model.get('prosody_speaker_centers'),
+                lambda_ce=loss_params.get('lambda_prosody_spk', 0),
+                lambda_center=loss_params.get('lambda_prosody_center', 0),
+                lambda_margin=loss_params.get('lambda_speaker_margin', 0),
+                margin=loss_params.get('speaker_center_margin', 1.0),
             )
             s = model.style_encoder(
                 st.unsqueeze(1) if multispeaker else gt.unsqueeze(1)
@@ -764,6 +813,7 @@ def main(config_path, dataset, name, resume):
                 + loss_params.lambda_slm * loss_lm
                 + loss_params.lambda_sty * loss_sty
                 + loss_params.lambda_diff * loss_diff
+                + prosody_spk_loss
             )
 
             running_loss += loss_mel.item()
@@ -773,8 +823,12 @@ def main(config_path, dataset, name, resume):
             optimizer.step("bert")
             optimizer.step("predictor")
             optimizer.step("predictor_encoder")
+            if 'prosody_speaker_classifier' in model:
+                optimizer.step("prosody_speaker_classifier")
+            if 'prosody_speaker_centers' in model:
+                optimizer.step("prosody_speaker_centers")
 
-            if epoch >= diff_epoch:
+            if diffusion_enabled and epoch >= diff_epoch:
                 optimizer.step("diffusion")
 
             if epoch >= joint_epoch:
@@ -842,14 +896,16 @@ def main(config_path, dataset, name, resume):
                     if p.grad is not None:
                         p.grad *= slmadv_params.scale
 
-                for p in model.diffusion.parameters():
-                    if p.grad is not None:
-                        p.grad *= slmadv_params.scale
+                if diffusion_enabled:
+                    for p in model.diffusion.parameters():
+                        if p.grad is not None:
+                            p.grad *= slmadv_params.scale
 
                 optimizer.step("bert_encoder")
                 optimizer.step("bert")
                 optimizer.step("predictor")
-                optimizer.step("diffusion")
+                if diffusion_enabled:
+                    optimizer.step("diffusion")
 
                 # SLM discriminator loss
                 if d_loss_slm != 0:
@@ -864,7 +920,7 @@ def main(config_path, dataset, name, resume):
 
             if (i + 1) % log_interval == 0:
                 logger.info(
-                    "Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, LM Loss: %.5f, Gen Loss: %.5f, Sty Loss: %.5f, Diff Loss: %.5f, DiscLM Loss: %.5f, GenLM Loss: %.5f"
+                    "Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, LM Loss: %.5f, Gen Loss: %.5f, Sty Loss: %.5f, Diff Loss: %.5f, DiscLM Loss: %.5f, GenLM Loss: %.5f, ProsodyCE: %.5f, ProsodyCenter: %.5f, SpkMargin: %.5f"
                     % (
                         epoch + 1,
                         epochs,
@@ -882,6 +938,9 @@ def main(config_path, dataset, name, resume):
                         loss_diff,
                         d_loss_slm,
                         loss_gen_lm,
+                        prosody_spk_ce,
+                        prosody_center_loss,
+                        prosody_margin_loss,
                     )
                 )
 
@@ -897,6 +956,9 @@ def main(config_path, dataset, name, resume):
                 writer.add_scalar("train/diff_loss", loss_diff, iters)
                 writer.add_scalar("train/d_loss_slm", d_loss_slm, iters)
                 writer.add_scalar("train/gen_loss_slm", loss_gen_lm, iters)
+                writer.add_scalar("train/prosody_spk_ce", prosody_spk_ce, iters)
+                writer.add_scalar("train/prosody_center_loss", prosody_center_loss, iters)
+                writer.add_scalar("train/speaker_margin_loss", prosody_margin_loss, iters)
 
                 running_loss = 0
 
@@ -917,7 +979,7 @@ def main(config_path, dataset, name, resume):
 
                 try:
                     waves = batch[0]
-                    batch = [b.to(eval_device) for b in batch[1:]]
+                    batch = [b.to(eval_device) for b in batch[1:-2]]
                     (
                         texts,
                         input_lengths,
@@ -1084,7 +1146,7 @@ def main(config_path, dataset, name, resume):
             )
 
             # if estimate sigma, save the estimated sigma
-            if model_params.diffusion.dist.estimate_sigma_data:
+            if diffusion_enabled and model_params.diffusion.dist.estimate_sigma_data:
                 config["model_params"]["diffusion"]["dist"]["sigma_data"] = float(
                     np.mean(running_std)
                 )

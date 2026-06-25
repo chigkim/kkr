@@ -19,7 +19,13 @@ def load_plbert(log_dir, vocab_size=None):
         plbert_config['model_params']['vocab_size'] = vocab_size
     
     albert_base_configuration = AlbertConfig(**plbert_config['model_params'])
-    bert = CustomAlbert(albert_base_configuration)
+    # Prefer PyTorch native scaled dot-product attention for lower memory use.
+    # Transformers may default to SDPA for ALBERT already, but making this explicit
+    # keeps both training stages deterministic across Transformers versions.
+    try:
+        bert = CustomAlbert._from_config(albert_base_configuration, attn_implementation='sdpa')
+    except Exception:
+        bert = CustomAlbert(albert_base_configuration)
 
     files = os.listdir(log_dir)
     ckpts = []

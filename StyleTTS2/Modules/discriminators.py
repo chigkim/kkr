@@ -105,13 +105,17 @@ class MultiResSpecDiscriminator(torch.nn.Module):
             ]
         )
 
-    def forward(self, y, y_hat):
+    def forward(self, y, y_hat, real_no_grad=False):
         y_d_rs = []
         y_d_gs = []
         fmap_rs = []
         fmap_gs = []
         for i, d in enumerate(self.discriminators):
-            y_d_r, fmap_r = d(y)
+            if real_no_grad:
+                with torch.no_grad():
+                    y_d_r, fmap_r = d(y)
+            else:
+                y_d_r, fmap_r = d(y)
             y_d_g, fmap_g = d(y_hat)
             y_d_rs.append(y_d_r)
             fmap_rs.append(fmap_r)
@@ -204,13 +208,17 @@ class MultiPeriodDiscriminator(torch.nn.Module):
             ]
         )
 
-    def forward(self, y, y_hat):
+    def forward(self, y, y_hat, real_no_grad=False):
         y_d_rs = []
         y_d_gs = []
         fmap_rs = []
         fmap_gs = []
         for i, d in enumerate(self.discriminators):
-            y_d_r, fmap_r = d(y)
+            if real_no_grad:
+                with torch.no_grad():
+                    y_d_r, fmap_r = d(y)
+            else:
+                y_d_r, fmap_r = d(y)
             y_d_g, fmap_g = d(y_hat)
             y_d_rs.append(y_d_r)
             fmap_rs.append(fmap_r)

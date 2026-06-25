@@ -50,6 +50,7 @@ from meldataset import build_dataloader
 from kokoro_symbols import TextCleaner
 from symbols_config import apply_symbols_config
 from kokoro_tb_utils import prepare_test_tokens, extract_voicepack, run_kokoro_inference
+from speaker_losses import SpeakerClassifier, SpeakerCenters, speaker_separation_loss
 from utils import *
 from losses import *
 from optimizers import build_optimizer
@@ -127,7 +128,8 @@ def _apply_processed_dataset(config, dataset):
         with open(manifest_path, encoding='utf-8') as f:
             manifest = yaml.safe_load(f)
         if manifest.get('dataset'):
-            data_params['root_path'] = manifest['dataset']
+            root_path = Path(manifest['dataset'])
+            data_params['root_path'] = str(root_path if root_path.is_absolute() else (REPO_ROOT / root_path).resolve())
 
     symbols_path = dataset_dir / 'symbols.json'
     if symbols_path.exists():
@@ -151,7 +153,7 @@ def _resolve_runtime_paths(config, config_path, dataset=None, name=None):
     _apply_name(config, name, dataset)
     config_dir = Path(config_path).resolve().parent
     if config.get('pretrained_model'):
-        config['pretrained_model'] = _resolve_path(config['pretrained_model'], config_dir)
+        config['pretrained_model'] = _resolve_path(config['pretrained_model'], REPO_ROOT)
     for key in ['ASR_config', 'ASR_path', 'F0_path', 'PLBERT_dir']:
         if key in config and config[key]:
             config[key] = _resolve_path(config[key], STYLETTS2_ROOT)
@@ -159,6 +161,16 @@ def _resolve_runtime_paths(config, config_path, dataset=None, name=None):
     for key in ['train_data', 'val_data', 'root_path', 'OOD_data']:
         if key in data_params and data_params[key]:
             data_params[key] = _resolve_path(data_params[key], config_dir)
+
+
+def _num_speakers_from_lists(*lists):
+    speaker_ids = []
+    for data_list in lists:
+        for line in data_list:
+            parts = line.strip().split('|')
+            if len(parts) >= 3:
+                speaker_ids.append(int(parts[2]))
+    return max(speaker_ids) + 1 if speaker_ids else 1
 
 
 @click.command()
@@ -271,13 +283,25 @@ def main(config_path, dataset, name, resume):
 
     model_params = recursive_munch(config["model_params"])
     multispeaker = model_params.multispeaker
-    model = build_model(model_params, text_aligner, pitch_extractor, plbert)
+    loss_params = Munch(config["loss_params"])
+    diffusion_enabled = loss_params.get('lambda_diff', 0) > 0 and loss_params.get('diff_epoch', 999) < epochs
+    model = build_model(model_params, text_aligner, pitch_extractor, plbert, enable_diffusion=diffusion_enabled)
+    if not diffusion_enabled:
+        logger.info('Diffusion model disabled; skipping diffusion module allocation')
+
+    num_speakers = int(config.get('num_speakers') or _num_speakers_from_lists(train_list, val_list))
+    style_dim = int(config['model_params'].get('style_dim', 128))
+    if loss_params.get('lambda_timbre_spk', 0) > 0:
+        model['timbre_speaker_classifier'] = SpeakerClassifier(style_dim, num_speakers)
+    if loss_params.get('lambda_timbre_center', 0) > 0 or loss_params.get('lambda_speaker_margin', 0) > 0:
+        model['timbre_speaker_centers'] = SpeakerCenters(num_speakers, style_dim)
+    if 'timbre_speaker_classifier' in model or 'timbre_speaker_centers' in model:
+        logger.info(f'Enabled timbre speaker separation loss for {num_speakers} speakers')
 
     best_loss = float("inf")  # best test loss
     loss_train_record = list([])
     loss_test_record = list([])
 
-    loss_params = Munch(config["loss_params"])
     TMA_epoch = loss_params.TMA_epoch
 
     for k in model:
@@ -394,6 +418,8 @@ def main(config_path, dataset, name, resume):
     # ─────────────────────────────────────────────────────────────────────────
 
     for epoch in range(start_epoch, epochs):
+        if device == "mps":
+            torch.mps.empty_cache()
         running_loss = 0
         start_time = time.time()
 
@@ -401,7 +427,9 @@ def main(config_path, dataset, name, resume):
 
         for i, batch in enumerate(train_dataloader):
             waves = batch[0]
-            batch = [b.to(device) for b in batch[1:]]
+            labels = batch[-2].to(device)
+            ref_labels = batch[-1].to(device)
+            batch = [b.to(device) for b in batch[1:-2]]
             texts, input_lengths, _, _, mels, mel_input_length, ref_mels = batch
 
             with torch.no_grad():
@@ -492,6 +520,16 @@ def main(config_path, dataset, name, resume):
             s = model.style_encoder(
                 st.unsqueeze(1) if multispeaker else gt.unsqueeze(1)
             )
+            timbre_spk_loss, timbre_spk_ce, timbre_center_loss, timbre_margin_loss = speaker_separation_loss(
+                s,
+                ref_labels if multispeaker else labels,
+                classifier=model.get('timbre_speaker_classifier'),
+                centers=model.get('timbre_speaker_centers'),
+                lambda_ce=loss_params.get('lambda_timbre_spk', 0),
+                lambda_center=loss_params.get('lambda_timbre_center', 0),
+                lambda_margin=loss_params.get('lambda_speaker_margin', 0),
+                margin=loss_params.get('speaker_center_margin', 1.0),
+            )
 
             y_rec = model.decoder(en, F0_real, real_norm, s)
 
@@ -531,6 +569,7 @@ def main(config_path, dataset, name, resume):
                     + loss_params.lambda_s2s * loss_s2s
                     + loss_params.lambda_gen * loss_gen_all
                     + loss_params.lambda_slm * loss_slm
+                    + timbre_spk_loss
                 )
 
             else:
@@ -538,7 +577,7 @@ def main(config_path, dataset, name, resume):
                 loss_mono = 0
                 loss_gen_all = 0
                 loss_slm = 0
-                g_loss = loss_mel
+                g_loss = loss_mel + timbre_spk_loss
 
             running_loss += accelerator.gather(loss_mel).mean().item()
 
@@ -547,6 +586,10 @@ def main(config_path, dataset, name, resume):
             optimizer.step("text_encoder")
             optimizer.step("style_encoder")
             optimizer.step("decoder")
+            if 'timbre_speaker_classifier' in model:
+                optimizer.step("timbre_speaker_classifier")
+            if 'timbre_speaker_centers' in model:
+                optimizer.step("timbre_speaker_centers")
 
             if epoch >= TMA_epoch:
                 optimizer.step("text_aligner")
@@ -556,7 +599,7 @@ def main(config_path, dataset, name, resume):
 
             if (i + 1) % log_interval == 0 and accelerator.is_main_process:
                 log_print(
-                    "Epoch [%d/%d], Step [%d/%d], Mel Loss: %.5f, Gen Loss: %.5f, Disc Loss: %.5f, Mono Loss: %.5f, S2S Loss: %.5f, SLM Loss: %.5f"
+                    "Epoch [%d/%d], Step [%d/%d], Mel Loss: %.5f, Gen Loss: %.5f, Disc Loss: %.5f, Mono Loss: %.5f, S2S Loss: %.5f, SLM Loss: %.5f, TimbreCE: %.5f, TimbreCenter: %.5f, SpkMargin: %.5f"
                     % (
                         epoch + 1,
                         epochs,
@@ -568,6 +611,9 @@ def main(config_path, dataset, name, resume):
                         loss_mono,
                         loss_s2s,
                         loss_slm,
+                        timbre_spk_ce,
+                        timbre_center_loss,
+                        timbre_margin_loss,
                     ),
                     logger,
                 )
@@ -578,6 +624,9 @@ def main(config_path, dataset, name, resume):
                 writer.add_scalar("train/mono_loss", loss_mono, iters)
                 writer.add_scalar("train/s2s_loss", loss_s2s, iters)
                 writer.add_scalar("train/slm_loss", loss_slm, iters)
+                writer.add_scalar("train/timbre_spk_ce", timbre_spk_ce, iters)
+                writer.add_scalar("train/timbre_center_loss", timbre_center_loss, iters)
+                writer.add_scalar("train/speaker_margin_loss", timbre_margin_loss, iters)
 
                 running_loss = 0
 
@@ -593,7 +642,7 @@ def main(config_path, dataset, name, resume):
                 optimizer.zero_grad()
 
                 waves = batch[0]
-                batch = [b.to(device) for b in batch[1:]]
+                batch = [b.to(device) for b in batch[1:-2]]
                 texts, input_lengths, _, _, mels, mel_input_length, ref_mels = batch
 
                 with torch.no_grad():

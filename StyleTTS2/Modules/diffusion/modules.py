@@ -523,14 +523,31 @@ class AttentionBase(nn.Module):
     def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         # Split heads
         q, k, v = rearrange_many((q, k, v), "b n (h d) -> b h n d", h=self.num_heads)
-        # Compute similarity matrix
-        sim = einsum("... n d, ... m d -> ... n m", q, k)
-        sim = (sim + self.rel_pos(*sim.shape[-2:])) if self.use_rel_pos else sim
-        sim = sim * self.scale
-        # Get attention matrix with softmax
-        attn = sim.softmax(dim=-1)
-        # Compute values
-        out = einsum("... n m, ... m d -> ... n d", attn, v)
+
+        attn_mask = None
+        if self.use_rel_pos:
+            # Original eager path used: softmax((q @ k.T + rel_pos) * scale).
+            # SDPA applies the q/k scale internally, so scale the additive bias here
+            # to preserve the old math.
+            attn_mask = self.rel_pos(q.shape[-2], k.shape[-2]) * self.scale
+
+        try:
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+        except Exception:
+            # Fallback for backends/shapes where SDPA is not available.
+            sim = einsum("... n d, ... m d -> ... n m", q, k)
+            sim = (sim + self.rel_pos(*sim.shape[-2:])) if self.use_rel_pos else sim
+            sim = sim * self.scale
+            attn = sim.softmax(dim=-1)
+            out = einsum("... n m, ... m d -> ... n d", attn, v)
+
         out = rearrange(out, "b h n d -> b n (h d)")
         return self.to_out(out)
 

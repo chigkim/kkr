@@ -246,6 +246,8 @@ class Collater(object):
             mels,
             output_lengths,
             ref_mels,
+            labels,
+            ref_labels,
         )
 
 
@@ -278,7 +280,7 @@ def build_dataloader(
         num_workers=num_workers,
         drop_last=(not validation),
         collate_fn=collate_fn,
-        pin_memory=(device != "cpu"),
+        pin_memory=(device == "cuda"),
     )
 
     return data_loader

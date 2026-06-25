@@ -3,12 +3,12 @@ name: "vctk"
 batch_size: 4
 epochs: 10
 epochs_1st: 30
-epochs_2nd: 10
+epochs_2nd: 20
 save_freq: 1
 keep_last_checkpoints: 2
 tensorboard_baseline_samples: 0
 pretrained_model: "training/kokoro_base.pth"
-first_stage_path: "first_stage.pth"
+first_stage_path: "best_1st.pth"
 best_first_stage_path: "best_1st.pth"
 best_second_stage_path: "best_2nd.pth"
 load_only_params: true
@@ -93,6 +93,12 @@ loss_params:
   lambda_slm: 1.0                   # SLM adversarial (0 = disabled for stage 1)
   lambda_diff: 0.0                  # diffusion loss (0 = disabled, no diffusion)
   lambda_sty: 0.0                   # style reconstruction (0 = disabled)
+  lambda_timbre_spk: 0.1            # Stage 1: speaker CE loss on style_encoder timbre vector
+  lambda_timbre_center: 0.01        # Stage 1: pull timbre vectors toward learned speaker centers
+  lambda_prosody_spk: 0.05          # Stage 2: speaker CE loss on predictor_encoder prosody vector
+  lambda_prosody_center: 0.005      # Stage 2: pull prosody vectors toward learned speaker centers
+  lambda_speaker_margin: 0.01       # Push learned speaker centers apart
+  speaker_center_margin: 1.0        # Margin for normalized center distance
   TMA_epoch: 0                      # start alignment from epoch 0 (fine-tuning, not training from scratch)
   diff_epoch: 999                   # effectively disable diffusion training
   joint_epoch: 3                    # start SLM joint training

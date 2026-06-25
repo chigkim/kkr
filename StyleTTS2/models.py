@@ -750,7 +750,7 @@ def load_ASR_models(ASR_MODEL_PATH, ASR_MODEL_CONFIG):
     return asr_model
 
 
-def build_model(args, text_aligner, pitch_extractor, bert):
+def build_model(args, text_aligner, pitch_extractor, bert, enable_diffusion=True):
     assert args.decoder.type in ["istftnet", "hifigan"], "Decoder type unknown"
 
     if args.decoder.type == "istftnet":
@@ -804,41 +804,6 @@ def build_model(args, text_aligner, pitch_extractor, bert):
         dim_in=args.dim_in, style_dim=args.style_dim, max_conv_dim=args.hidden_dim
     )  # prosodic style encoder
 
-    # define diffusion model
-    if args.multispeaker:
-        transformer = StyleTransformer1d(
-            channels=args.style_dim * 2,
-            context_embedding_features=bert.config.hidden_size,
-            context_features=args.style_dim * 2,
-            **args.diffusion.transformer,
-        )
-    else:
-        transformer = Transformer1d(
-            channels=args.style_dim * 2,
-            context_embedding_features=bert.config.hidden_size,
-            **args.diffusion.transformer,
-        )
-
-    diffusion = AudioDiffusionConditional(
-        in_channels=1,
-        embedding_max_length=bert.config.max_position_embeddings,
-        embedding_features=bert.config.hidden_size,
-        embedding_mask_proba=args.diffusion.embedding_mask_proba,  # Conditional dropout of batch elements,
-        channels=args.style_dim * 2,
-        context_features=args.style_dim * 2,
-    )
-
-    diffusion.diffusion = KDiffusion(
-        net=diffusion.unet,
-        sigma_distribution=LogNormalDistribution(
-            mean=args.diffusion.dist.mean, std=args.diffusion.dist.std
-        ),
-        sigma_data=args.diffusion.dist.sigma_data,  # a placeholder, will be changed dynamically when start training diffusion model
-        dynamic_threshold=0.0,
-    )
-    diffusion.diffusion.net = transformer
-    diffusion.unet = transformer
-
     nets = Munch(
         bert=bert,
         bert_encoder=nn.Linear(bert.config.hidden_size, args.hidden_dim),
@@ -847,7 +812,6 @@ def build_model(args, text_aligner, pitch_extractor, bert):
         text_encoder=text_encoder,
         predictor_encoder=predictor_encoder,
         style_encoder=style_encoder,
-        diffusion=diffusion,
         text_aligner=text_aligner,
         pitch_extractor=pitch_extractor,
         mpd=MultiPeriodDiscriminator(),
@@ -857,6 +821,43 @@ def build_model(args, text_aligner, pitch_extractor, bert):
             args.slm.hidden, args.slm.nlayers, args.slm.initial_channel
         ),
     )
+
+    if enable_diffusion:
+        # define diffusion model
+        if args.multispeaker:
+            transformer = StyleTransformer1d(
+                channels=args.style_dim * 2,
+                context_embedding_features=bert.config.hidden_size,
+                context_features=args.style_dim * 2,
+                **args.diffusion.transformer,
+            )
+        else:
+            transformer = Transformer1d(
+                channels=args.style_dim * 2,
+                context_embedding_features=bert.config.hidden_size,
+                **args.diffusion.transformer,
+            )
+
+        diffusion = AudioDiffusionConditional(
+            in_channels=1,
+            embedding_max_length=bert.config.max_position_embeddings,
+            embedding_features=bert.config.hidden_size,
+            embedding_mask_proba=args.diffusion.embedding_mask_proba,  # Conditional dropout of batch elements,
+            channels=args.style_dim * 2,
+            context_features=args.style_dim * 2,
+        )
+
+        diffusion.diffusion = KDiffusion(
+            net=diffusion.unet,
+            sigma_distribution=LogNormalDistribution(
+                mean=args.diffusion.dist.mean, std=args.diffusion.dist.std
+            ),
+            sigma_data=args.diffusion.dist.sigma_data,  # a placeholder, will be changed dynamically when start training diffusion model
+            dynamic_threshold=0.0,
+        )
+        diffusion.diffusion.net = transformer
+        diffusion.unet = transformer
+        nets.diffusion = diffusion
 
     return nets
 
