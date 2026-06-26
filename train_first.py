@@ -722,7 +722,7 @@ def main(config_path, dataset, name, resume):
         if accelerator.is_main_process:
             print("Epochs:", epoch + 1)
             log_print(
-                "Validation loss: %.3f" % (loss_test / iters_test) + "\n\n\n\n", logger
+                "Validation loss: %.6f" % (loss_test / iters_test) + "\n\n\n\n", logger
             )
             print("\n\n\n")
             writer.add_scalar("eval/mel_loss", loss_test / iters_test, epoch + 1)
@@ -734,6 +734,7 @@ def main(config_path, dataset, name, resume):
                 is_best = val_loss < best_loss
                 if is_best:
                     best_loss = val_loss
+                    logger.info("New best Stage 1 validation loss: %.6f", best_loss)
                 print("Saving..")
                 state = {
                     "net": {key: model[key].state_dict() for key in model},

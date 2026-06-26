@@ -1111,7 +1111,7 @@ def main(config_path, dataset, name, resume):
 
         print("Epochs:", epoch + 1)
         logger.info(
-            "Validation loss: %.3f, Dur loss: %.3f, F0 loss: %.3f"
+            "Validation loss: %.6f, Dur loss: %.6f, F0 loss: %.6f"
             % (loss_test / iters_test, loss_align / iters_test, loss_f / iters_test)
             + "\n\n\n"
         )
@@ -1125,6 +1125,7 @@ def main(config_path, dataset, name, resume):
             is_best = val_loss < best_loss
             if is_best:
                 best_loss = val_loss
+                logger.info("New best Stage 2 validation loss: %.6f", best_loss)
             print("Saving..")
             state = {
                 "net": {key: model[key].state_dict() for key in model},
