@@ -793,7 +793,7 @@ def main(config_path, dataset, name, resume):
             "val_loss": loss_test / iters_test,
             "epoch": epoch,
         }
-        save_path = osp.join(log_dir, config.get("first_stage_path", "first_stage.pth"))
+        save_path = osp.join(log_dir, config.get("final_first_stage_path", "first_stage.pth"))
         atomic_torch_save(state, save_path)
 
 

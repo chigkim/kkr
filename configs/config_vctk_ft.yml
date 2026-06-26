@@ -8,11 +8,14 @@ save_freq: 1
 keep_last_checkpoints: 2
 tensorboard_baseline_samples: 0
 pretrained_model: "training/kokoro_base.pth"
+# Stage 2 loads first_stage_path; Stage 1 writes final_first_stage_path at the end.
+# Keep final_first_stage_path separate so the final checkpoint cannot overwrite best_1st.pth.
 first_stage_path: "best_1st.pth"
 best_first_stage_path: "best_1st.pth"
+final_first_stage_path: "first_stage.pth"
 best_second_stage_path: "best_2nd.pth"
 load_only_params: true
-second_stage_load_pretrained: false  # false = load from first_stage.pth (recommended)
+second_stage_load_pretrained: false  # false = load from first_stage_path (best_1st.pth, recommended)
 
 data_params:
   min_length: 50                    # min phoneme sequence length (chars)
