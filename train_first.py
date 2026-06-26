@@ -349,10 +349,14 @@ def main(config_path, dataset, name, resume):
                 load_only_params=load_only_params,
             )
             if not load_only_params:
+                best_path = osp.join(log_dir, config.get("best_first_stage_path", "best_1st.pth"))
+                best_source = best_path if osp.exists(best_path) else checkpoint_path
                 try:
-                    best_loss = torch.load(checkpoint_path, map_location="cpu").get("val_loss", best_loss)
+                    best_value = torch.load(best_source, map_location="cpu").get("val_loss", best_loss)
+                    best_loss = float(best_value.item() if torch.is_tensor(best_value) else best_value)
+                    logger.info("Loaded best Stage 1 validation loss %.6f from %s", best_loss, best_source)
                 except Exception:
-                    pass
+                    logger.warning("Could not load best Stage 1 validation loss from %s", best_source)
                 start_epoch += 1
                 logger.info(f"Resuming first-stage training from epoch {start_epoch}")
         else:

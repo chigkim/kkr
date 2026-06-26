@@ -446,12 +446,16 @@ def main(config_path, dataset, name, resume):
 
     n_down = model.text_aligner.n_down
 
-    best_loss = float("inf")  # best test loss
+    best_loss = float("inf")  # best validation loss seen so far
     if resume_checkpoint is not None:
+        best_path = osp.join(log_dir, config.get("best_second_stage_path", "best_2nd.pth"))
+        best_source = best_path if osp.exists(best_path) else resume_checkpoint
         try:
-            best_loss = torch.load(resume_checkpoint, map_location="cpu").get("val_loss", best_loss)
+            best_value = torch.load(best_source, map_location="cpu").get("val_loss", best_loss)
+            best_loss = float(best_value.item() if torch.is_tensor(best_value) else best_value)
+            logger.info("Loaded best Stage 2 validation loss %.6f from %s", best_loss, best_source)
         except Exception:
-            pass
+            logger.warning("Could not load best Stage 2 validation loss from %s", best_source)
     loss_train_record = list([])
     loss_test_record = list([])
     iters = 0
