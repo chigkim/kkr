@@ -7,6 +7,7 @@ epochs_2nd: 20
 save_freq: 1
 keep_last_checkpoints: 2
 tensorboard_baseline_samples: 0
+mps_empty_cache_interval: 10       # prevent WavLM/SLM MPS cache from exhausting unified memory
 pretrained_model: "training/kokoro_base.pth"
 # Stage 2 loads first_stage_path; Stage 1 writes final_first_stage_path at the end.
 # Keep final_first_stage_path separate so the final checkpoint cannot overwrite best_1st.pth.
@@ -19,7 +20,7 @@ second_stage_load_pretrained: false  # false = load from first_stage_path (best_
 
 data_params:
   min_length: 50                    # min phoneme sequence length (chars)
-  num_workers: 4                    # CPU workers for data loading
+  num_workers: 2                    # CPU workers for data loading; keep low on unified-memory Macs
 
 preprocess_params:
   sr: 24000
@@ -125,8 +126,8 @@ PLBERT_dir: "Utils/PLBERT/"
 
 slmadv_params:
   min_len: 100
-  max_len: 500
-  batch_percentage: 0.5
+  max_len: 300       # lower SLM clip length to avoid MPS unified-memory pressure
+  batch_percentage: 0.25
   iter: 10
   thresh: 5
   scale: 0.01

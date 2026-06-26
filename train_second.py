@@ -4,6 +4,11 @@ import sys
 from pathlib import Path
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+# Keep PyTorch/MPS from expanding into most unified memory.  When WavLM/SLM
+# adversarial training is active, uncapped MPS allocations can push macOS into
+# heavy swap while process RSS still looks small.
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.90")
+os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.80")
 
 REPO_ROOT = Path(__file__).resolve().parent
 STYLETTS2_ROOT = REPO_ROOT / 'StyleTTS2'
@@ -910,8 +915,27 @@ def main(config_path, dataset, name, resume):
                 # SLM discriminator loss
                 if d_loss_slm != 0:
                     optimizer.zero_grad()
-                    d_loss_slm.backward(retain_graph=True)
+                    # d_loss_slm only trains the WavLM discriminator on detached
+                    # audio/features, so retaining the generator graph here is
+                    # unnecessary and can accumulate MPS unified memory.
+                    d_loss_slm.backward()
                     optimizer.step("wd")
+
+                d_loss_slm_value = (
+                    d_loss_slm.item() if torch.is_tensor(d_loss_slm) else d_loss_slm
+                )
+                loss_gen_lm_value = (
+                    loss_gen_lm.item() if torch.is_tensor(loss_gen_lm) else loss_gen_lm
+                )
+                del slm_out, y_pred, loss_gen_lm, d_loss_slm
+                d_loss_slm, loss_gen_lm = d_loss_slm_value, loss_gen_lm_value
+                mps_cache_interval = config.get("mps_empty_cache_interval", 25)
+                if (
+                    device == "mps"
+                    and mps_cache_interval > 0
+                    and (i + 1) % mps_cache_interval == 0
+                ):
+                    torch.mps.empty_cache()
 
             else:
                 d_loss_slm, loss_gen_lm = 0, 0
