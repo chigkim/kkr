@@ -128,7 +128,7 @@ PLBERT_dir: "Utils/PLBERT/"
 slmadv_params:
   min_len: 100
   max_len: 300       # lower SLM clip length to avoid MPS unified-memory pressure
-  batch_percentage: 0.25
+  batch_percentage: 0.5
   iter: 10
   thresh: 5
   scale: 0.01

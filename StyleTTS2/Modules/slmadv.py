@@ -148,6 +148,7 @@ class SLMAdversarialLoss(torch.nn.Module):
 
         wav = []
 
+        target_clips = max(2, int(np.ceil(self.batch_percentage * len(waves))))
         for bib in range(len(output_lengths)):
             mel_length_pred = output_lengths[bib]
             mel_length_gt = int(mel_input_length[bib].item() / 2)
@@ -167,9 +168,7 @@ class SLMAdversarialLoss(torch.nn.Module):
             ]
             wav.append(torch.from_numpy(y).to(dtype=torch.float32, device=ref_text.device))
 
-            if len(wav) >= self.batch_percentage * len(
-                waves
-            ):  # prevent OOM due to longer lengths
+            if len(wav) >= target_clips:  # prevent OOM due to longer lengths
                 break
 
         if len(sp) <= 1:
