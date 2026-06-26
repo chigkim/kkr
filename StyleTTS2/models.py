@@ -10,6 +10,44 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _run_lstm_avoiding_mps_packed(lstm, x, lengths=None):
+    '''Run LSTM on CPU when the caller is on MPS.
+
+    PyTorch decomposes packed/variable-length LSTMs on MPS into many tiny MPSGraph
+    launches and caches a graph per shape.  In long StyleTTS2 runs this can make
+    training crawl and grow unified-memory pressure.  CPU LSTM is faster and more
+    stable for these small recurrent blocks; autograd copies gradients back to the
+    MPS input and leaves the LSTM parameters trainable on CPU.
+    '''
+    original_device = x.device
+    use_cpu_lstm = original_device.type == 'mps'
+    if use_cpu_lstm:
+        if next(lstm.parameters()).device.type != 'cpu':
+            lstm.to('cpu')
+        x = x.to('cpu')
+
+    if lengths is not None:
+        x = nn.utils.rnn.pack_padded_sequence(
+            x,
+            lengths,
+            batch_first=True,
+            enforce_sorted=False,
+        )
+
+    lstm.flatten_parameters()
+    x, hidden = lstm(x)
+
+    if lengths is not None:
+        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
+
+    if use_cpu_lstm:
+        x = x.to(original_device)
+        if hidden is not None:
+            hidden = tuple(h.to(original_device) for h in hidden)
+
+    return x, hidden
 from torch.nn.utils.parametrizations import weight_norm, spectral_norm
 
 from Utils.ASR.models import ASRCNN
@@ -397,19 +435,13 @@ class TextEncoder(nn.Module):
         x = x.transpose(1, 2)  # [B, T, chn]
 
         input_lengths = input_lengths.cpu().numpy()
-        x = nn.utils.rnn.pack_padded_sequence(
-            x, input_lengths, batch_first=True, enforce_sorted=False
-        )
-
-        self.lstm.flatten_parameters()
-        x, _ = self.lstm(x)
-        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
+        x, _ = _run_lstm_avoiding_mps_packed(self.lstm, x, input_lengths)
 
         x = x.transpose(-1, -2)
-        x_pad = torch.zeros([x.shape[0], x.shape[1], m.shape[-1]])
+        x_pad = x.new_zeros([x.shape[0], x.shape[1], m.shape[-1]])
 
         x_pad[:, :, : x.shape[-1]] = x
-        x = x_pad.to(x.device)
+        x = x_pad
 
         x.masked_fill_(m, 0.0)
 
@@ -420,8 +452,7 @@ class TextEncoder(nn.Module):
         x = x.transpose(1, 2)
         x = self.cnn(x)
         x = x.transpose(1, 2)
-        self.lstm.flatten_parameters()
-        x, _ = self.lstm(x)
+        x, _ = _run_lstm_avoiding_mps_packed(self.lstm, x)
         return x
 
     def length_to_mask(self, lengths):
@@ -594,20 +625,15 @@ class ProsodyPredictor(nn.Module):
 
         # predict duration
         input_lengths = text_lengths.cpu().numpy()
-        x = nn.utils.rnn.pack_padded_sequence(
-            d, input_lengths, batch_first=True, enforce_sorted=False
-        )
 
         m = m.to(text_lengths.device).unsqueeze(1)
 
-        self.lstm.flatten_parameters()
-        x, _ = self.lstm(x)
-        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
+        x, _ = _run_lstm_avoiding_mps_packed(self.lstm, d, input_lengths)
 
-        x_pad = torch.zeros([x.shape[0], m.shape[-1], x.shape[-1]])
+        x_pad = x.new_zeros([x.shape[0], m.shape[-1], x.shape[-1]])
 
         x_pad[:, : x.shape[1], :] = x
-        x = x_pad.to(x.device)
+        x = x_pad
 
         duration = self.duration_proj(
             nn.functional.dropout(x, 0.5, training=self.training)
@@ -618,7 +644,7 @@ class ProsodyPredictor(nn.Module):
         return duration.squeeze(-1), en
 
     def F0Ntrain(self, x, s):
-        x, _ = self.shared(x.transpose(-1, -2))
+        x, _ = _run_lstm_avoiding_mps_packed(self.shared, x.transpose(-1, -2))
 
         F0 = x.transpose(-1, -2)
         for block in self.F0:
@@ -683,19 +709,14 @@ class DurationEncoder(nn.Module):
                 x.masked_fill_(masks.unsqueeze(-1).transpose(-1, -2), 0.0)
             else:
                 x = x.transpose(-1, -2)
-                x = nn.utils.rnn.pack_padded_sequence(
-                    x, input_lengths, batch_first=True, enforce_sorted=False
-                )
-                block.flatten_parameters()
-                x, _ = block(x)
-                x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
+                x, _ = _run_lstm_avoiding_mps_packed(block, x, input_lengths)
                 x = F.dropout(x, p=self.dropout, training=self.training)
                 x = x.transpose(-1, -2)
 
-                x_pad = torch.zeros([x.shape[0], x.shape[1], m.shape[-1]])
+                x_pad = x.new_zeros([x.shape[0], x.shape[1], m.shape[-1]])
 
                 x_pad[:, :, : x.shape[-1]] = x
-                x = x_pad.to(x.device)
+                x = x_pad
 
         return x.transpose(-1, -2)
 

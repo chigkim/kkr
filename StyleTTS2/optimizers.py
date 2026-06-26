@@ -32,6 +32,17 @@ class MultiOptimizer:
         _ = [self._step(key, scaler) for key in keys]
 
     def _step(self, key, scaler=None):
+        # Some MPS-hostile recurrent submodules are intentionally run on CPU
+        # during forward.  If an optimizer state was restored while those
+        # parameters were still on MPS, move state tensors lazily before step.
+        for group in self.optimizers[key].param_groups:
+            for p in group['params']:
+                state = self.optimizers[key].state.get(p)
+                if not state:
+                    continue
+                for state_key, value in list(state.items()):
+                    if torch.is_tensor(value) and value.device != p.device:
+                        state[state_key] = value.to(p.device)
         if scaler is not None:
             scaler.step(self.optimizers[key])
             scaler.update()

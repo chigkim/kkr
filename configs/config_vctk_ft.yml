@@ -7,6 +7,7 @@ epochs_2nd: 20
 save_freq: 1
 keep_last_checkpoints: 2
 tensorboard_baseline_samples: 0
+log_interval: 1                    # temporary: expose slow MPS steps immediately after resume
 mps_empty_cache_interval: 10       # prevent WavLM/SLM MPS cache from exhausting unified memory
 pretrained_model: "training/kokoro_base.pth"
 # Stage 2 loads first_stage_path; Stage 1 writes final_first_stage_path at the end.
