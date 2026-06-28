@@ -217,13 +217,18 @@ class TextCleaner:
     def __init__(self, dummy=0, symbols_path=None):
         self.symbols = load_symbols(symbols_path)
         self.word_index_dictionary = {sym: i for i, sym in enumerate(self.symbols)}
+        # The Kokoro/ASR checkpoints used here have 178 embedding rows (0..177).
+        # If KOKORO_SYMBOLS_PATH leaks in from another run with extra symbols,
+        # skip those out-of-range tokens instead of producing invalid IDs.
+        self.max_index = len(symbols) - 1
 
     def __call__(self, text):
-        # Map each character to its index, skip unknown chars
+        # Map each character to its index, skip unknown or checkpoint-incompatible chars
         indexes = []
         for char in text:
-            if char in self.word_index_dictionary:
-                indexes.append(self.word_index_dictionary[char])
+            idx = self.word_index_dictionary.get(char)
+            if idx is not None and idx <= self.max_index:
+                indexes.append(idx)
         return indexes
 
 

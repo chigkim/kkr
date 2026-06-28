@@ -146,6 +146,13 @@ def generator_TPRLS_loss(disc_real_outputs, disc_generated_outputs):
         loss += tau - F.relu(tau - L_rel)
     return loss
 
+def _module_device(module):
+    try:
+        return next(module.parameters()).device
+    except StopIteration:
+        return None
+
+
 class GeneratorLoss(torch.nn.Module):
 
     def __init__(self, mpd, msd):
@@ -154,6 +161,10 @@ class GeneratorLoss(torch.nn.Module):
         self.msd = msd
         
     def forward(self, y, y_hat):
+        disc_device = _module_device(self.mpd)
+        if disc_device is not None and y.device != disc_device:
+            y = y.to(disc_device)
+            y_hat = y_hat.to(disc_device)
         y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self.mpd(y, y_hat, real_no_grad=True)
         y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self.msd(y, y_hat, real_no_grad=True)
         loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
@@ -175,6 +186,10 @@ class DiscriminatorLoss(torch.nn.Module):
         self.msd = msd
         
     def forward(self, y, y_hat):
+        disc_device = _module_device(self.mpd)
+        if disc_device is not None and y.device != disc_device:
+            y = y.to(disc_device)
+            y_hat = y_hat.to(disc_device)
         # MPD
         y_df_hat_r, y_df_hat_g, _, _ = self.mpd(y, y_hat)
         loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)

@@ -181,7 +181,21 @@ class Collater(object):
         self.text_pad_index = 0
         self.min_mel_length = 192
         self.max_mel_length = 192
+        self.text_bucket_stride = 64
+        self.mel_bucket_stride = 64
         self.return_wave = return_wave
+
+    def _bucket_length(self, length, stride):
+        '''Bucket padding lengths to reduce MPSGraph shape-cache churn.'''
+        return int(((length + stride - 1) // stride) * stride)
+
+    def _bucket_text_length(self, length):
+        return self._bucket_length(length, self.text_bucket_stride)
+
+    def _bucket_mel_length(self, length):
+        # Be defensive for dataloader workers that unpickle an older Collater
+        # instance after code changes during iterative runs.
+        return self._bucket_length(length, getattr(self, 'mel_bucket_stride', 64))
 
     def __call__(self, batch):
         # batch[0] = wave, mel, text, f0, speakerid
@@ -193,9 +207,9 @@ class Collater(object):
         batch = [batch[bid] for bid in batch_indexes]
 
         nmels = batch[0][1].size(0)
-        max_mel_length = max([b[1].shape[1] for b in batch])
-        max_text_length = max([b[2].shape[0] for b in batch])
-        max_rtext_length = max([b[3].shape[0] for b in batch])
+        max_mel_length = self._bucket_mel_length(max([b[1].shape[1] for b in batch]))
+        max_text_length = self._bucket_text_length(max([b[2].shape[0] for b in batch]))
+        max_rtext_length = self._bucket_text_length(max([b[3].shape[0] for b in batch]))
 
         labels = torch.zeros((batch_size)).long()
         mels = torch.zeros((batch_size, nmels, max_mel_length)).float()

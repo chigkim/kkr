@@ -10,6 +10,7 @@ if str(STYLETTS2_ROOT) not in sys.path:
     sys.path.insert(0, str(STYLETTS2_ROOT))
 
 import os.path as osp
+import gc
 import glob
 import re
 import sys
@@ -173,6 +174,59 @@ def _num_speakers_from_lists(*lists):
     return max(speaker_ids) + 1 if speaker_ids else 1
 
 
+def _gb(value):
+    return float(value) / 1024 ** 3
+
+
+def _torch_memory_report_line(device):
+    if device == 'mps' and torch.backends.mps.is_available():
+        try:
+            current = torch.mps.current_allocated_memory()
+            driver = torch.mps.driver_allocated_memory()
+            recommended = torch.mps.recommended_max_memory()
+            return 'MPS: cur=%.2f drv=%.2f max=%.2f' % (_gb(current), _gb(driver), _gb(recommended))
+        except Exception as exc:
+            return f'MPS mem unavailable: {type(exc).__name__}'
+    if device == 'cuda' and torch.cuda.is_available():
+        try:
+            return 'CUDA alloc=%.2f reserved=%.2f max=%.2f' % (
+                _gb(torch.cuda.memory_allocated()),
+                _gb(torch.cuda.memory_reserved()),
+                _gb(torch.cuda.max_memory_allocated()),
+            )
+        except Exception as exc:
+            return f'CUDA mem unavailable: {type(exc).__name__}'
+    return 'torch_mem=n/a'
+
+
+def _format_elapsed(seconds):
+    seconds = int(seconds)
+    minutes, seconds = divmod(seconds, 60)
+    return f'{minutes}m{seconds:02d}s'
+
+
+def _format_eta(seconds):
+    seconds = int(seconds)
+    hours, rem = divmod(seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f'{hours}h{minutes:02d}m{seconds:02d}s'
+
+
+def _length_to_width_mask(lengths, width):
+    '''Build a mask matching a padded/bucketed tensor width.'''
+    mask = length_to_mask(lengths)
+    if mask.size(1) < width:
+        mask = F.pad(mask, (0, width - mask.size(1)), value=True)
+    elif mask.size(1) > width:
+        mask = mask[:, :width]
+    return mask
+
+
+def _length_to_text_mask(lengths, text_width):
+    '''Build a mask matching padded/bucketed text tensor width.'''
+    return _length_to_width_mask(lengths, text_width)
+
+
 @click.command()
 @click.option("-p", "--config_path", default="Configs/config.yml", type=str)
 @click.option('--dataset', type=str, default=None, help='Processed dataset directory from prepare_dataset.py')
@@ -214,6 +268,9 @@ def main(config_path, dataset, name, resume):
     print(f"Using {device} device")
     if device == "mps":
         os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+        prev_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        logger.info(f"Set torch CPU threads: {prev_threads} -> {torch.get_num_threads()} for MPS native-heap pressure")
     logger.info(f"Using device: {device}")
 
     epochs = config.get("epochs_1st", 200)
@@ -421,8 +478,10 @@ def main(config_path, dataset, name, resume):
             logger.info("Skipping TensorBoard baseline voicepack extraction")
     # ─────────────────────────────────────────────────────────────────────────
 
+    epoch_durations = []
     for epoch in range(start_epoch, epochs):
         if device == "mps":
+            gc.collect()
             torch.mps.empty_cache()
         running_loss = 0
         start_time = time.time()
@@ -437,8 +496,9 @@ def main(config_path, dataset, name, resume):
             texts, input_lengths, _, _, mels, mel_input_length, ref_mels = batch
 
             with torch.no_grad():
-                mask = length_to_mask(mel_input_length // (2**n_down)).to(device)
-                text_mask = length_to_mask(input_lengths).to(texts.device)
+                aligner_width = mels.size(2) // (2**n_down)
+                mask = _length_to_width_mask(mel_input_length // (2**n_down), aligner_width).to(device)
+                text_mask = _length_to_text_mask(input_lengths, texts.size(1)).to(texts.device)
 
 
             ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
@@ -603,7 +663,7 @@ def main(config_path, dataset, name, resume):
 
             if (i + 1) % log_interval == 0 and accelerator.is_main_process:
                 log_print(
-                    "Epoch [%d/%d], Step [%d/%d], Mel Loss: %.5f, Gen Loss: %.5f, Disc Loss: %.5f, Mono Loss: %.5f, S2S Loss: %.5f, SLM Loss: %.5f, TimbreCE: %.5f, TimbreCenter: %.5f, SpkMargin: %.5f"
+                    "Epoch=%d/%d Step=%d/%d Mel=%.2f Gen=%.2f Disc=%.2f Mono=%.2f S2S=%.2f SLM=%.2f TimbreCE=%.2f TimbreCenter=%.2f SpkMargin=%.2f Elapsed=%s\n%s"
                     % (
                         epoch + 1,
                         epochs,
@@ -618,6 +678,8 @@ def main(config_path, dataset, name, resume):
                         timbre_spk_ce,
                         timbre_center_loss,
                         timbre_margin_loss,
+                        _format_elapsed(time.time() - start_time),
+                        _torch_memory_report_line(device),
                     ),
                     logger,
                 )
@@ -634,8 +696,6 @@ def main(config_path, dataset, name, resume):
 
                 running_loss = 0
 
-                print("Time elasped:", time.time() - start_time)
-
         loss_test = 0
 
         _ = [model[key].eval() for key in model]
@@ -650,14 +710,15 @@ def main(config_path, dataset, name, resume):
                 texts, input_lengths, _, _, mels, mel_input_length, ref_mels = batch
 
                 with torch.no_grad():
-                    mask = length_to_mask(mel_input_length // (2**n_down)).to(device)
+                    aligner_width = mels.size(2) // (2**n_down)
+                    mask = _length_to_width_mask(mel_input_length // (2**n_down), aligner_width).to(device)
                     ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
 
                     s2s_attn = s2s_attn.transpose(-1, -2)
                     s2s_attn = s2s_attn[..., 1:]
                     s2s_attn = s2s_attn.transpose(-1, -2)
 
-                    text_mask = length_to_mask(input_lengths).to(texts.device)
+                    text_mask = _length_to_text_mask(input_lengths, texts.size(1)).to(texts.device)
                     attn_mask = (
                         (~mask)
                         .unsqueeze(-1)
@@ -724,11 +785,14 @@ def main(config_path, dataset, name, resume):
                 iters_test += 1
 
         if accelerator.is_main_process:
-            print("Epochs:", epoch + 1)
+            epoch_duration = time.time() - start_time
+            epoch_durations.append(epoch_duration)
+            remaining_epochs = max(epochs - (epoch + 1), 0)
+            eta = sum(epoch_durations) / len(epoch_durations) * remaining_epochs
             log_print(
-                "Validation loss: %.6f" % (loss_test / iters_test) + "\n\n\n\n", logger
+                "Epochs %d: Duration=%s ETA=%s Validation loss=%.6f"
+                % (epoch + 1, _format_elapsed(epoch_duration), _format_eta(eta), loss_test / iters_test), logger
             )
-            print("\n\n\n")
             writer.add_scalar("eval/mel_loss", loss_test / iters_test, epoch + 1)
             attn_image = get_image(s2s_attn[0].cpu().numpy().squeeze())
             writer.add_figure("eval/attn", attn_image, epoch)
@@ -739,7 +803,6 @@ def main(config_path, dataset, name, resume):
                 if is_best:
                     best_loss = val_loss
                     logger.info("New best Stage 1 validation loss: %.6f", best_loss)
-                print("Saving..")
                 state = {
                     "net": {key: model[key].state_dict() for key in model},
                     "optimizer": optimizer.state_dict(),
@@ -761,9 +824,6 @@ def main(config_path, dataset, name, resume):
 
             # ── Kokoro-faithful TensorBoard inference (every epoch) ───────────
             _ = [model[key].eval() for key in model]
-            logger.info(
-                f"Epoch {epoch}: extracting voicepack for TensorBoard inference..."
-            )
             _vp, _acoustic_norm, _prosodic_norm = extract_voicepack(
                 model,
                 root_path,
@@ -773,7 +833,7 @@ def main(config_path, dataset, name, resume):
             writer.add_scalar("voicepack/acoustic_norm", _acoustic_norm, epoch + 1)
             writer.add_scalar("voicepack/prosodic_norm", _prosodic_norm, epoch + 1)
             logger.info(
-                f"  acoustic_norm={_acoustic_norm:.4f}  prosodic_norm={_prosodic_norm:.4f}"
+                f"Epoch {epoch + 1}: acoustic_norm={_acoustic_norm:.4f} prosodic_norm={_prosodic_norm:.4f}"
             )
             if _vp is not None and _test_tokens:
                 _epoch_audio = run_kokoro_inference(

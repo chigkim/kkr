@@ -73,7 +73,7 @@ class SpecDiscriminator(nn.Module):
             self.fft_size,
             self.shift_size,
             self.win_length,
-            self.window.to(y.get_device()),
+            self.window.to(y.device),
         )
         y = y.unsqueeze(1)
         for i, d in enumerate(self.discriminators):

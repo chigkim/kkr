@@ -16,6 +16,7 @@ if str(STYLETTS2_ROOT) not in sys.path:
     sys.path.insert(0, str(STYLETTS2_ROOT))
 
 import copy
+import gc
 import random
 import yaml
 import time
@@ -187,6 +188,73 @@ def _num_speakers_from_lists(*lists):
     return max(speaker_ids) + 1 if speaker_ids else 1
 
 
+def _crop_adversarial_audio(y, y_hat, segment_size):
+    '''Use a fixed waveform length for MPD/MSD to avoid MPSGraph cache growth.'''
+    if not segment_size or segment_size <= 0:
+        return y, y_hat
+    length = min(y.size(-1), y_hat.size(-1))
+    if length > segment_size:
+        start = torch.randint(0, length - segment_size + 1, (), device='cpu').item()
+        return y[..., start:start + segment_size], y_hat[..., start:start + segment_size]
+    if length < segment_size:
+        pad = segment_size - length
+        return F.pad(y[..., :length], (0, pad)), F.pad(y_hat[..., :length], (0, pad))
+    return y[..., :length], y_hat[..., :length]
+
+
+def _gb(value):
+    return float(value) / 1024 ** 3
+
+
+def _torch_memory_report_line(device):
+    if device == 'mps' and torch.backends.mps.is_available():
+        try:
+            current = torch.mps.current_allocated_memory()
+            driver = torch.mps.driver_allocated_memory()
+            recommended = torch.mps.recommended_max_memory()
+            return 'MPS: cur=%.2f drv=%.2f max=%.2f' % (_gb(current), _gb(driver), _gb(recommended))
+        except Exception as exc:
+            return f'MPS mem unavailable: {type(exc).__name__}'
+    if device == 'cuda' and torch.cuda.is_available():
+        try:
+            return 'CUDA alloc=%.2f reserved=%.2f max=%.2f' % (
+                _gb(torch.cuda.memory_allocated()),
+                _gb(torch.cuda.memory_reserved()),
+                _gb(torch.cuda.max_memory_allocated()),
+            )
+        except Exception as exc:
+            return f'CUDA mem unavailable: {type(exc).__name__}'
+    return 'torch_mem=n/a'
+
+
+def _format_elapsed(seconds):
+    seconds = int(seconds)
+    minutes, seconds = divmod(seconds, 60)
+    return f'{minutes}m{seconds:02d}s'
+
+
+def _format_eta(seconds):
+    seconds = int(seconds)
+    hours, rem = divmod(seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f'{hours}h{minutes:02d}m{seconds:02d}s'
+
+
+def _length_to_width_mask(lengths, width):
+    '''Build a mask matching a padded/bucketed tensor width.'''
+    mask = length_to_mask(lengths)
+    if mask.size(1) < width:
+        mask = F.pad(mask, (0, width - mask.size(1)), value=True)
+    elif mask.size(1) > width:
+        mask = mask[:, :width]
+    return mask
+
+
+def _length_to_text_mask(lengths, text_width):
+    '''Build a mask matching padded/bucketed text tensor width.'''
+    return _length_to_width_mask(lengths, text_width)
+
+
 @click.command()
 @click.option("-p", "--config_path", default="Configs/config.yml", type=str)
 @click.option('--dataset', type=str, default=None, help='Processed dataset directory from prepare_dataset.py')
@@ -239,6 +307,8 @@ def main(config_path, dataset, name, resume):
     loss_params = Munch(config["loss_params"])
     diff_epoch = loss_params.diff_epoch
     joint_epoch = loss_params.joint_epoch
+    slm_enabled = loss_params.lambda_slm > 0
+    slmadv_enabled = slm_enabled and loss_params.get('slmadv_enabled', True)
 
     optimizer_params = Munch(config["optimizer_params"])
 
@@ -247,10 +317,33 @@ def main(config_path, dataset, name, resume):
     print(f"Using {device} device")
     if device == "mps":
         os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+        prev_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        logger.info(f"Set torch CPU threads: {prev_threads} -> {torch.get_num_threads()} for MPS native-heap pressure")
     logger.info(f"Using device: {device} (MPS Fallback: {os.environ.get('PYTORCH_ENABLE_MPS_FALLBACK', '0')})")
     eval_device = config.get("eval_device", "cpu" if device == "mps" else device)
     if eval_device != device:
         logger.info(f"Using device: {eval_device} for validation and TensorBoard inference")
+    aligner_device = config.get("aligner_device", "cpu" if device == "mps" else device)
+    if aligner_device != device:
+        logger.info(f"Using device: {aligner_device} for text aligner to avoid variable-mel MPSGraph cache growth")
+    discriminator_device = config.get("discriminator_device", device)
+    if discriminator_device != device:
+        logger.info(f"Using device: {discriminator_device} for MPD/MSD discriminators")
+    wavlm_device = config.get("wavlm_device", "cpu" if device == "mps" else device)
+    if slm_enabled and wavlm_device != device:
+        logger.info(f"Using device: {wavlm_device} for frozen WavLM perceptual loss")
+    adversarial_segment_size = int(config.get("adversarial_segment_size", sr if device == "mps" else 0) or 0)
+    if adversarial_segment_size > 0:
+        logger.info(f"Using fixed MPD/MSD segment size: {adversarial_segment_size} samples")
+    slm_segment_size = int(config.get("slm_segment_size", sr if device == "mps" else 0) or 0)
+    if slm_segment_size > 0:
+        logger.info(f"Using fixed WavLM segment size: {slm_segment_size} samples")
+    fixed_training_mel_len = bool(config.get('fixed_training_mel_len', device == 'mps'))
+    fixed_training_mel_len_frames = int(config.get('fixed_training_mel_len_frames') or (max_len // 2))
+    fixed_training_mel_len_frames = min(fixed_training_mel_len_frames, max_len // 2)
+    if fixed_training_mel_len:
+        logger.info(f"Using fixed Stage 2 training mel length: {fixed_training_mel_len_frames} frames")
 
     train_dataloader = build_dataloader(
         train_list,
@@ -295,7 +388,13 @@ def main(config_path, dataset, name, resume):
     model = build_model(model_params, text_aligner, pitch_extractor, plbert, enable_diffusion=diffusion_enabled)
     if not diffusion_enabled:
         logger.info('Diffusion model disabled; skipping diffusion module allocation')
+    if not slm_enabled:
+        logger.info('SLM/WavLM loss and adversarial updates disabled (lambda_slm <= 0)')
+    elif not slmadv_enabled:
+        logger.info('WavLM loss enabled; SLM adversarial updates disabled (slmadv_enabled=false)')
     _ = [model[key].to(device) for key in model]
+    if aligner_device != device:
+        model.text_aligner.to(aligner_device)
 
     start_epoch = 0
     iters = 0
@@ -360,14 +459,18 @@ def main(config_path, dataset, name, resume):
     if 'prosody_speaker_classifier' in model or 'prosody_speaker_centers' in model:
         logger.info(f'Enabled prosody speaker separation loss for {num_speakers} speakers')
 
-    gl = GeneratorLoss(model.mpd, model.msd).to(device)
-    dl = DiscriminatorLoss(model.mpd, model.msd).to(device)
-    wl = WavLMLoss(model_params.slm.model, model.wd, sr, model_params.slm.sr).to(device)
+    if discriminator_device != device:
+        model.mpd.to(discriminator_device)
+        model.msd.to(discriminator_device)
+    gl = GeneratorLoss(model.mpd, model.msd).to(discriminator_device)
+    dl = DiscriminatorLoss(model.mpd, model.msd).to(discriminator_device)
+    wl = WavLMLoss(model_params.slm.model, model.wd, sr, model_params.slm.sr).to(wavlm_device) if slm_enabled else None
 
     if device == "cuda":
         gl = MyDataParallel(gl)
         dl = MyDataParallel(dl)
-        wl = MyDataParallel(wl)
+        if slm_enabled:
+            wl = MyDataParallel(wl)
 
     sampler = None
     if diffusion_enabled:
@@ -464,6 +567,7 @@ def main(config_path, dataset, name, resume):
     if device == "cuda":
         torch.cuda.empty_cache()
     elif device == "mps":
+        gc.collect()
         torch.mps.empty_cache()
 
     stft_loss = MultiResolutionSTFTLoss().to(device)
@@ -476,17 +580,30 @@ def main(config_path, dataset, name, resume):
     running_std = []
 
     slmadv_params = Munch(config["slmadv_params"])
-    slmadv = SLMAdversarialLoss(
-        model,
-        wl,
-        sampler,
-        slmadv_params.min_len,
-        slmadv_params.max_len,
-        batch_percentage=slmadv_params.batch_percentage,
-        skip_update=slmadv_params.iter,
-        sig=slmadv_params.sig,
-        diffusion_enabled=diffusion_enabled,
-    )
+    slmadv = None
+    if slmadv_enabled:
+        slmadv = SLMAdversarialLoss(
+            model,
+            wl,
+            sampler,
+            slmadv_params.min_len,
+            slmadv_params.max_len,
+            batch_percentage=slmadv_params.batch_percentage,
+            skip_update=slmadv_params.iter,
+            sig=slmadv_params.sig,
+            diffusion_enabled=diffusion_enabled,
+            fixed_mel_len=slmadv_params.get('slm_fixed_mel_len', None),
+            fixed_crop_size=slmadv_params.get('slm_fixed_crop_size', None),
+            conv_on_cpu=slmadv_params.get('slm_conv_on_cpu', False),
+        )
+        logger.info(
+            'SLM adversarial enabled: fixed_mel_len=%s fixed_crop_size=%s conv_on_cpu=%s'
+            % (
+                slmadv_params.get('slm_fixed_mel_len', None),
+                slmadv_params.get('slm_fixed_crop_size', None),
+                slmadv_params.get('slm_conv_on_cpu', False),
+            )
+        )
 
     # ── Kokoro-faithful TensorBoard inference setup ───────────────────────────
     text_cleaner = TextCleaner()
@@ -527,13 +644,22 @@ def main(config_path, dataset, name, resume):
             logger.info(f"  baseline/test_{i + 1:02d}: {text[:60]}")
     if eval_device != device:
         _ = [model[key].to(device) for key in model]
+        if aligner_device != device:
+            model.text_aligner.to(aligner_device)
+        if discriminator_device != device:
+            model.mpd.to(discriminator_device)
+            model.msd.to(discriminator_device)
     _ = [model[key].train() for key in model]
     # ─────────────────────────────────────────────────────────────────────────
 
+    epoch_durations = []
     for epoch in range(start_epoch, epochs):
         if device == "mps":
+            gc.collect()
             torch.mps.empty_cache()
         running_loss = 0
+        skipped_short_batches = 0
+        skipped_aligner_batches = 0
         start_time = time.time()
 
         _ = [model[key].eval() for key in model]
@@ -547,7 +673,11 @@ def main(config_path, dataset, name, resume):
             waves = batch[0]
             labels = batch[-2].to(device)
             ref_labels = batch[-1].to(device)
-            batch = [b.to(device) for b in batch[1:-2]]
+            batch_cpu = batch[1:-2]
+            aligner_texts = batch_cpu[0].to(aligner_device)
+            aligner_mels = batch_cpu[4].to(aligner_device)
+            aligner_mel_input_length = batch_cpu[5].to(aligner_device)
+            batch = [b.to(device) for b in batch_cpu]
             (
                 texts,
                 input_lengths,
@@ -559,16 +689,30 @@ def main(config_path, dataset, name, resume):
             ) = batch
 
             with torch.no_grad():
-                mask = length_to_mask(mel_input_length // (2**n_down)).to(device)
-                mel_mask = length_to_mask(mel_input_length).to(device)
-                text_mask = length_to_mask(input_lengths).to(texts.device)
+                aligner_width = aligner_mels.size(2) // (2**n_down)
+                mask = _length_to_width_mask(aligner_mel_input_length // (2**n_down), aligner_width).to(aligner_device)
+                text_mask = _length_to_text_mask(input_lengths, texts.size(1)).to(texts.device)
 
                 try:
-                    _, _, s2s_attn = model.text_aligner(mels, mask, texts)
+                    _, _, s2s_attn = model.text_aligner(
+                        aligner_mels.detach(),
+                        mask,
+                        aligner_texts,
+                    )
                     s2s_attn = s2s_attn.transpose(-1, -2)
                     s2s_attn = s2s_attn[..., 1:]
-                    s2s_attn = s2s_attn.transpose(-1, -2)
-                except:
+                    s2s_attn = s2s_attn.transpose(-1, -2).to(device)
+                except Exception as exc:
+                    skipped_aligner_batches += 1
+                    if skipped_aligner_batches <= 3:
+                        logger.exception(
+                            'Skipping batch after text_aligner error: %s: %s; text_min=%d text_max=%d emb=%d',
+                            type(exc).__name__,
+                            exc,
+                            int(aligner_texts.min().item()),
+                            int(aligner_texts.max().item()),
+                            int(model.text_aligner.asr_s2s.embedding.num_embeddings),
+                        )
                     continue
 
                 mask_ST = mask_from_lens(
@@ -607,21 +751,28 @@ def main(config_path, dataset, name, resume):
                     ref_sp = model.predictor_encoder(ref_mels.unsqueeze(1))
                     ref = torch.cat([ref_ss, ref_sp], dim=1)
 
-            # compute the style of the entire utterance
-            # this operation cannot be done in batch because of the avgpool layer (may need to work on masked avgpool)
-            ss = []
-            gs = []
-            for bib in range(len(mel_input_length)):
-                mel_length = int(mel_input_length[bib].item())
-                mel = mels[bib, :, : mel_input_length[bib]]
-                s = model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1))
-                ss.append(s)
-                s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
-                gs.append(s)
+            # Compute full-utterance target style only when it is actually needed.
+            # This per-sample path slices to raw, unbucketed mel lengths and creates
+            # many MPSGraph shape variants. With diffusion and SLM adversarial disabled
+            # it is dead work; s_dur is recomputed later from fixed-shape ref_mels/gt.
+            need_s_trg = diffusion_enabled or slmadv_enabled
+            if need_s_trg:
+                # This operation cannot be done in batch because of the avgpool layer
+                # (may need to work on masked avgpool).
+                ss = []
+                gs = []
+                for bib in range(len(mel_input_length)):
+                    mel = mels[bib, :, : mel_input_length[bib]]
+                    s = model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1))
+                    ss.append(s)
+                    s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
+                    gs.append(s)
 
-            s_dur = torch.stack(ss).squeeze(1)  # global prosodic styles
-            gs = torch.stack(gs).squeeze(1)  # global acoustic styles
-            s_trg = torch.cat([gs, s_dur], dim=-1).detach()  # ground truth for denoiser
+                s_dur = torch.stack(ss).squeeze(1)  # global prosodic styles
+                gs = torch.stack(gs).squeeze(1)  # global acoustic styles
+                s_trg = torch.cat([gs, s_dur], dim=-1).detach()  # ground truth for denoiser
+            else:
+                s_trg = None
 
             bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
             if bert_dur is not None and torch.isnan(bert_dur).any():
@@ -639,6 +790,12 @@ def main(config_path, dataset, name, resume):
                 import sys
 
                 sys.exit(1)
+
+            # Use the fixed-shape reference mel for duration/prosody conditioning.
+            # Do this once before predictor(); avoid the old raw-length per-sample
+            # style loop when diffusion/SLM adversarial are disabled.
+            s_dur_source = ref_mels.detach() if multispeaker else mels.detach()
+            s_dur = model.predictor_encoder(s_dur_source.unsqueeze(1))
 
             # denoiser training
             if diffusion_enabled and epoch >= diff_epoch:
@@ -699,7 +856,17 @@ def main(config_path, dataset, name, resume):
 
                 sys.exit(1)
 
-            mel_len = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
+            if fixed_training_mel_len:
+                # Pin decoder/STFT/WavLM shapes on MPS. Variable mel_len creates
+                # distinct MPSGraph executables that accumulate in driver/native memory.
+                # Use a smaller fixed window than max_len//2 to avoid the previous
+                # max-length MPS peak/OOM while keeping shapes stable.
+                mel_len = fixed_training_mel_len_frames
+                if int(mel_input_length.min().item() / 2) <= mel_len + 1:
+                    skipped_short_batches += 1
+                    continue
+            else:
+                mel_len = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
             en = []
             gt = []
             p_en = []
@@ -734,9 +901,6 @@ def main(config_path, dataset, name, resume):
                 F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
             N_real = log_norm(gt.unsqueeze(1)).squeeze(1)
 
-            s_dur = model.predictor_encoder(
-                st.unsqueeze(1) if multispeaker else gt.unsqueeze(1)
-            )
             prosody_spk_loss, prosody_spk_ce, prosody_center_loss, prosody_margin_loss = speaker_separation_loss(
                 s_dur,
                 ref_labels if multispeaker else labels,
@@ -752,14 +916,17 @@ def main(config_path, dataset, name, resume):
             )
 
             y_rec_gt = wav.unsqueeze(1)
-            y_rec_gt_pred = model.decoder(en, F0_real, N_real, s)
+            y_rec_gt_pred = None
 
             if epoch >= joint_epoch:
                 # ground truth from recording
                 wav = y_rec_gt  # use recording since decoder is tuned
             else:
-                # ground truth from reconstruction
-                wav = y_rec_gt_pred  # use reconstruction since decoder is fixed
+                # Ground truth from reconstruction since decoder is fixed.
+                # This is a target branch; do not keep a second decoder autograd graph.
+                with torch.no_grad():
+                    y_rec_gt_pred = model.decoder(en, F0_real, N_real, s).detach()
+                wav = y_rec_gt_pred
 
             F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s_dur)
 
@@ -769,11 +936,15 @@ def main(config_path, dataset, name, resume):
             loss_norm_rec = F.smooth_l1_loss(N_real, N_fake)
 
             if start_ds:
+                wav_adv, y_rec_adv = _crop_adversarial_audio(wav, y_rec, adversarial_segment_size)
+                wav_adv_disc = wav_adv.detach().to(discriminator_device)
+                y_rec_adv_disc_detached = y_rec_adv.detach().to(discriminator_device)
                 optimizer.zero_grad()
-                d_loss = dl(wav.detach(), y_rec.detach()).mean()
+                d_loss = dl(wav_adv_disc, y_rec_adv_disc_detached).mean()
                 d_loss.backward()
                 optimizer.step("msd")
                 optimizer.step("mpd")
+                del wav_adv_disc, y_rec_adv_disc_detached
             else:
                 d_loss = 0
 
@@ -787,10 +958,20 @@ def main(config_path, dataset, name, resume):
 
                 sys.exit(1)
             if start_ds:
-                loss_gen_all = gl(wav, y_rec).mean()
+                loss_gen_all = gl(
+                    wav_adv.detach().to(discriminator_device),
+                    y_rec_adv.to(discriminator_device),
+                ).mean().to(device)
             else:
                 loss_gen_all = 0
-            loss_lm = wl(wav.detach().squeeze(1), y_rec.squeeze(1)).mean()
+            if slm_enabled:
+                wav_lm, y_rec_lm = _crop_adversarial_audio(wav.detach(), y_rec, slm_segment_size)
+                loss_lm = wl(
+                    wav_lm.squeeze(1).to(wavlm_device),
+                    y_rec_lm.squeeze(1).to(wavlm_device),
+                ).mean().to(device)
+            else:
+                loss_lm = 0
 
             loss_ce = 0
             loss_dur = 0
@@ -844,6 +1025,7 @@ def main(config_path, dataset, name, resume):
                 optimizer.step("style_encoder")
                 optimizer.step("decoder")
 
+            if epoch >= joint_epoch and slmadv_enabled:
                 # randomly pick whether to use in-distribution text
                 if np.random.rand() < 0.5:
                     use_ind = True
@@ -854,6 +1036,9 @@ def main(config_path, dataset, name, resume):
                     ref_lengths = input_lengths
                     ref_texts = texts
 
+                if y_rec_gt_pred is None:
+                    with torch.no_grad():
+                        y_rec_gt_pred = model.decoder(en, F0_real, N_real, s).detach()
                 slm_out = slmadv(
                     i,
                     y_rec_gt,
@@ -933,22 +1118,24 @@ def main(config_path, dataset, name, resume):
                 )
                 del slm_out, y_pred, loss_gen_lm, d_loss_slm
                 d_loss_slm, loss_gen_lm = d_loss_slm_value, loss_gen_lm_value
-                mps_cache_interval = config.get("mps_empty_cache_interval", 25)
-                if (
-                    device == "mps"
-                    and mps_cache_interval > 0
-                    and (i + 1) % mps_cache_interval == 0
-                ):
-                    torch.mps.empty_cache()
 
             else:
                 d_loss_slm, loss_gen_lm = 0, 0
+
+            mps_cache_interval = config.get("mps_empty_cache_interval", 25)
+            if (
+                device == "mps"
+                and mps_cache_interval > 0
+                and (i + 1) % mps_cache_interval == 0
+            ):
+                gc.collect()
+                torch.mps.empty_cache()
 
             iters = iters + 1
 
             if (i + 1) % log_interval == 0:
                 logger.info(
-                    "Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, LM Loss: %.5f, Gen Loss: %.5f, Sty Loss: %.5f, Diff Loss: %.5f, DiscLM Loss: %.5f, GenLM Loss: %.5f, ProsodyCE: %.5f, ProsodyCenter: %.5f, SpkMargin: %.5f"
+                    "Epoch=%d/%d Step=%d/%d Loss=%.2f Disc=%.2f Dur=%.2f CE=%.2f Norm=%.2f F0=%.2f LM=%.2f Gen=%.2f Sty=%.2f Diff=%.2f DiscLM=%.2f GenLM=%.2f ProsodyCE=%.2f ProsodyCenter=%.2f SpkMargin=%.2f Elapsed=%s\n%s"
                     % (
                         epoch + 1,
                         epochs,
@@ -969,6 +1156,8 @@ def main(config_path, dataset, name, resume):
                         prosody_spk_ce,
                         prosody_center_loss,
                         prosody_margin_loss,
+                        _format_elapsed(time.time() - start_time),
+                        _torch_memory_report_line(device),
                     )
                 )
 
@@ -990,7 +1179,11 @@ def main(config_path, dataset, name, resume):
 
                 running_loss = 0
 
-                print("Time elasped:", time.time() - start_time)
+        if skipped_short_batches or skipped_aligner_batches:
+            logger.info(
+                'Epoch=%d/%d skipped_short_batches=%d skipped_aligner_batches=%d fixed_mel_len=%d'
+                % (epoch + 1, epochs, skipped_short_batches, skipped_aligner_batches, fixed_training_mel_len_frames)
+            )
 
         loss_test = 0
         loss_align = 0
@@ -1018,15 +1211,22 @@ def main(config_path, dataset, name, resume):
                         ref_mels,
                     ) = batch
                     with torch.no_grad():
-                        mask = length_to_mask(mel_input_length // (2**n_down)).to(
-                            eval_device
-                        )
-                        text_mask = length_to_mask(input_lengths).to(texts.device)
+                        aligner_mels = mels.detach().to(aligner_device)
+                        aligner_width = aligner_mels.size(2) // (2**n_down)
+                        mask = _length_to_width_mask(
+                            mel_input_length.to(aligner_device) // (2**n_down),
+                            aligner_width,
+                        ).to(aligner_device)
+                        text_mask = _length_to_text_mask(input_lengths, texts.size(1)).to(texts.device)
 
-                        _, _, s2s_attn = model.text_aligner(mels, mask, texts)
+                        _, _, s2s_attn = model.text_aligner(
+                            aligner_mels,
+                            mask,
+                            texts.to(aligner_device),
+                        )
                         s2s_attn = s2s_attn.transpose(-1, -2)
                         s2s_attn = s2s_attn[..., 1:]
-                        s2s_attn = s2s_attn.transpose(-1, -2)
+                        s2s_attn = s2s_attn.transpose(-1, -2).to(eval_device)
 
                         mask_ST = mask_from_lens(
                             s2s_attn, input_lengths, mel_input_length // (2**n_down)
@@ -1137,13 +1337,14 @@ def main(config_path, dataset, name, resume):
                     traceback.print_exc()
                     continue
 
-        print("Epochs:", epoch + 1)
+        epoch_duration = time.time() - start_time
+        epoch_durations.append(epoch_duration)
+        remaining_epochs = max(epochs - (epoch + 1), 0)
+        eta = sum(epoch_durations) / len(epoch_durations) * remaining_epochs
         logger.info(
-            "Validation loss: %.6f, Dur loss: %.6f, F0 loss: %.6f"
-            % (loss_test / iters_test, loss_align / iters_test, loss_f / iters_test)
-            + "\n\n\n"
+            "Epochs %d: Duration=%s ETA=%s Validation loss=%.6f, Dur loss=%.6f, F0 loss=%.6f"
+            % (epoch + 1, _format_elapsed(epoch_duration), _format_eta(eta), loss_test / iters_test, loss_align / iters_test, loss_f / iters_test)
         )
-        print("\n\n\n")
         writer.add_scalar("eval/mel_loss", loss_test / iters_test, epoch + 1)
         writer.add_scalar("eval/dur_loss", loss_align / iters_test, epoch + 1)
         writer.add_scalar("eval/F0_loss", loss_f / iters_test, epoch + 1)
@@ -1154,7 +1355,6 @@ def main(config_path, dataset, name, resume):
             if is_best:
                 best_loss = val_loss
                 logger.info("New best Stage 2 validation loss: %.6f", best_loss)
-            print("Saving..")
             state = {
                 "net": {key: model[key].state_dict() for key in model},
                 "optimizer": optimizer.state_dict(),
@@ -1185,7 +1385,6 @@ def main(config_path, dataset, name, resume):
 
         # ── Kokoro-faithful TensorBoard inference (every epoch) ───────────────
         _ = [model[key].eval() for key in model]
-        logger.info(f"Epoch {epoch}: extracting voicepack for TensorBoard inference...")
         _vp, _acoustic_norm, _prosodic_norm = extract_voicepack(
             model,
             root_path,
@@ -1195,7 +1394,7 @@ def main(config_path, dataset, name, resume):
         writer.add_scalar("voicepack/acoustic_norm", _acoustic_norm, epoch + 1)
         writer.add_scalar("voicepack/prosodic_norm", _prosodic_norm, epoch + 1)
         logger.info(
-            f"  acoustic_norm={_acoustic_norm:.4f}  prosodic_norm={_prosodic_norm:.4f}"
+            f"Epoch {epoch + 1}: acoustic_norm={_acoustic_norm:.4f} prosodic_norm={_prosodic_norm:.4f}"
         )
         if _vp is not None and _test_tokens:
             _epoch_audio = run_kokoro_inference(
@@ -1207,6 +1406,11 @@ def main(config_path, dataset, name, resume):
                 )
         if eval_device != device:
             _ = [model[key].to(device) for key in model]
+            if aligner_device != device:
+                model.text_aligner.to(aligner_device)
+            if discriminator_device != device:
+                model.mpd.to(discriminator_device)
+                model.msd.to(discriminator_device)
             stft_loss = stft_loss.to(device)
         _ = [model[key].train() for key in model]
         # ─────────────────────────────────────────────────────────────────────

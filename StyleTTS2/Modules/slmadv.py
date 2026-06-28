@@ -3,6 +3,18 @@ import numpy as np
 import torch.nn.functional as F
 
 
+def _fit_audio(x, length):
+    if length is None or length <= 0:
+        return x
+    length = int(length)
+    if x.size(-1) > length:
+        start = torch.randint(0, x.size(-1) - length + 1, (), device='cpu').item()
+        return x[..., start:start + length]
+    if x.size(-1) < length:
+        return F.pad(x, (0, length - x.size(-1)))
+    return x
+
+
 class SLMAdversarialLoss(torch.nn.Module):
     def __init__(
         self,
@@ -15,6 +27,9 @@ class SLMAdversarialLoss(torch.nn.Module):
         skip_update=10,
         sig=1.5,
         diffusion_enabled=True,
+        fixed_mel_len=None,
+        fixed_crop_size=None,
+        conv_on_cpu=False,
     ):
         super(SLMAdversarialLoss, self).__init__()
         self.model = model
@@ -28,6 +43,9 @@ class SLMAdversarialLoss(torch.nn.Module):
         self.sig = sig
         self.skip_update = skip_update
         self.diffusion_enabled = diffusion_enabled
+        self.fixed_mel_len = fixed_mel_len
+        self.fixed_crop_size = fixed_crop_size
+        self.conv_on_cpu = conv_on_cpu
 
     def forward(
         self,
@@ -88,20 +106,20 @@ class SLMAdversarialLoss(torch.nn.Module):
         attn_preds = []
 
         # differentiable duration modeling
+        conv_device = torch.device('cpu') if self.conv_on_cpu and ref_text.device.type == 'mps' else ref_text.device
         for _s2s_pred, _text_length in zip(d, ref_lengths):
-            _s2s_pred_org = _s2s_pred[:_text_length, :]
+            _s2s_pred_org = _s2s_pred[:_text_length, :].to(conv_device)
 
             _s2s_pred = torch.sigmoid(_s2s_pred_org)
             _dur_pred = _s2s_pred.sum(axis=-1)
 
             l = int(torch.round(_s2s_pred.sum()).item())
-            t = torch.arange(0, l).expand(l)
+            l = max(l, 1)
 
             t = (
-                torch.arange(0, l)
+                torch.arange(0, l, device=conv_device)
                 .unsqueeze(0)
                 .expand((len(_s2s_pred), l))
-                .to(ref_text.device)
             )
             loc = torch.cumsum(_dur_pred, dim=0) - _dur_pred / 2
 
@@ -115,7 +133,7 @@ class SLMAdversarialLoss(torch.nn.Module):
                 padding=h.shape[-1] - 1,
                 groups=int(_text_length),
             )[..., :l]
-            attn_preds.append(F.softmax(out.squeeze(), dim=0))
+            attn_preds.append(F.softmax(out.squeeze(), dim=0).to(ref_text.device))
 
             output_lengths.append(l)
 
@@ -134,8 +152,11 @@ class SLMAdversarialLoss(torch.nn.Module):
 
         _, p_pred = self.model.predictor(d_en, s_dur, ref_lengths, s2s_attn, text_mask)
 
-        mel_len = max(int(min(output_lengths) / 2 - 1), self.min_len // 2)
-        mel_len = min(mel_len, self.max_len // 2)
+        if self.fixed_mel_len is not None:
+            mel_len = int(self.fixed_mel_len)
+        else:
+            mel_len = max(int(min(output_lengths) / 2 - 1), self.min_len // 2)
+            mel_len = min(mel_len, self.max_len // 2)
 
         # get clips
 
@@ -182,15 +203,25 @@ class SLMAdversarialLoss(torch.nn.Module):
         F0_fake, N_fake = self.model.predictor.F0Ntrain(p_en, sp[:, 128:])
         y_pred = self.model.decoder(en, F0_fake, N_fake, sp[:, :128])
 
+        fixed_crop_size = int(self.fixed_crop_size) if self.fixed_crop_size is not None else None
+        if fixed_crop_size:
+            wav = _fit_audio(wav, fixed_crop_size)
+            y_pred = _fit_audio(y_pred, fixed_crop_size)
+            y_rec_gt_fixed = _fit_audio(y_rec_gt, fixed_crop_size)
+            y_rec_gt_pred_fixed = _fit_audio(y_rec_gt_pred, fixed_crop_size)
+        else:
+            y_rec_gt_fixed = y_rec_gt
+            y_rec_gt_pred_fixed = y_rec_gt_pred
+
         # discriminator loss
         if (iters + 1) % self.skip_update == 0:
             if np.random.randint(0, 2) == 0:
-                wav = y_rec_gt_pred
+                wav = y_rec_gt_pred_fixed
                 use_rec = True
             else:
                 use_rec = False
 
-            crop_size = min(wav.size(-1), y_pred.size(-1))
+            crop_size = fixed_crop_size if fixed_crop_size else min(wav.size(-1), y_pred.size(-1))
             if use_rec:  # use reconstructed (shorter lengths), do length invariant regularization
                 if wav.size(-1) > y_pred.size(-1):
                     real_GP = wav[:, :, :crop_size]
@@ -224,9 +255,9 @@ class SLMAdversarialLoss(torch.nn.Module):
                 # regularization (ignore length variation)
                 d_loss += loss_reg
 
-                out_gt = self.wl.discriminator_forward(y_rec_gt.detach().squeeze(1))
+                out_gt = self.wl.discriminator_forward(y_rec_gt_fixed.detach().squeeze(1))
                 out_rec = self.wl.discriminator_forward(
-                    y_rec_gt_pred.detach().squeeze(1)
+                    y_rec_gt_pred_fixed.detach().squeeze(1)
                 )
 
                 # regularization (ignore reconstruction artifacts)
