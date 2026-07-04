@@ -217,10 +217,10 @@ class TextCleaner:
     def __init__(self, dummy=0, symbols_path=None):
         self.symbols = load_symbols(symbols_path)
         self.word_index_dictionary = {sym: i for i, sym in enumerate(self.symbols)}
-        # The Kokoro/ASR checkpoints used here have 178 embedding rows (0..177).
-        # If KOKORO_SYMBOLS_PATH leaks in from another run with extra symbols,
-        # skip those out-of-range tokens instead of producing invalid IDs.
-        self.max_index = len(symbols) - 1
+        # Cap at the loaded vocab size: the trainers size every embedding
+        # (text encoder, PLBERT, text aligner) to len(self.symbols) via
+        # apply_symbols_config, so all of these IDs are valid.
+        self.max_index = len(self.symbols) - 1
 
     def __call__(self, text):
         # Map each character to its index, skip unknown or checkpoint-incompatible chars

@@ -775,7 +775,7 @@ def load_F0_models(path):
     return F0_model
 
 
-def load_ASR_models(ASR_MODEL_PATH, ASR_MODEL_CONFIG):
+def load_ASR_models(ASR_MODEL_PATH, ASR_MODEL_CONFIG, vocab_size=None):
     # load ASR model
     def _load_config(path):
         with open(path) as f:
@@ -784,9 +784,17 @@ def load_ASR_models(ASR_MODEL_PATH, ASR_MODEL_CONFIG):
         return model_config
 
     def _load_model(model_config, model_path):
+        expand_vocab = vocab_size is not None and vocab_size > model_config.get("n_token", 0)
+        if expand_vocab:
+            model_config = dict(model_config, n_token=vocab_size)
         model = ASRCNN(**model_config)
         params = torch.load(model_path, map_location="cpu")["model"]
-        model.load_state_dict(params)
+        if expand_vocab:
+            print(f"Expanding text aligner vocab to {vocab_size} tokens")
+            params = _expand_or_skip_state_dict(model, params)
+            model.load_state_dict(params, strict=False)
+        else:
+            model.load_state_dict(params)
         return model
 
     asr_model_config = _load_config(ASR_MODEL_CONFIG)
@@ -918,7 +926,7 @@ def _expand_or_skip_state_dict(module, state_dict):
         if current[name].shape == value.shape:
             adapted[name] = value
             continue
-        if value.ndim >= 2 and current[name].shape[1:] == value.shape[1:] and current[name].shape[0] >= value.shape[0]:
+        if value.ndim >= 1 and current[name].shape[1:] == value.shape[1:] and current[name].shape[0] >= value.shape[0]:
             expanded = current[name].clone()
             expanded[:value.shape[0]] = value
             if current[name].shape[0] > value.shape[0]:

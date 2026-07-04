@@ -259,6 +259,30 @@ def _crop_adversarial_audio(y, y_hat, segment_size):
     return y[..., :length], y_hat[..., :length]
 
 
+def _style_ref_crop(ref_mels, crop_frames, random_start=True):
+    '''Fixed-width circular time crop for style/prosody encoder inputs.
+
+    The collater zero-pads mels to the fixed MPS width, but the style encoders
+    average over time without masking, so padding (which is not silence in
+    normalized log-mel space) dilutes the style vector and mismatches
+    inference, where styles come from unpadded mels.  A circular crop inside
+    the true length keeps the shape fixed and never shows padding.  True
+    lengths are recovered from the content: padded frames are exactly zero.
+    '''
+    if not crop_frames or crop_frames <= 0:
+        return ref_mels
+    crop_frames = int(crop_frames)
+    lengths = (ref_mels.abs().sum(dim=1) > 0).sum(dim=-1).clamp(min=1)
+    if random_start:
+        starts = (torch.rand(ref_mels.size(0), device=ref_mels.device) * lengths).long()
+    else:
+        starts = torch.zeros_like(lengths)
+    base = torch.arange(crop_frames, device=ref_mels.device).unsqueeze(0)
+    idx = (starts.unsqueeze(1) + base) % lengths.unsqueeze(1)
+    idx = idx.unsqueeze(1).expand(ref_mels.size(0), ref_mels.size(1), crop_frames)
+    return torch.gather(ref_mels, dim=-1, index=idx)
+
+
 def _s2s_loss(s2s_pred, texts, input_lengths):
     '''Fixed-shape aligner sequence-to-sequence CE loss.
 
@@ -361,6 +385,9 @@ def main(config_path, dataset, name, resume):
     fixed_mps_text_length = int(config.get('fixed_mps_text_length', 0) or 0)
     fixed_mps_mel_length = int(config.get('fixed_mps_mel_length', 0) or 0)
     mps_safe_gather_crop = bool(config.get('mps_safe_gather_crop', device == 'mps'))
+    style_ref_crop_frames = int(config.get('style_ref_crop_frames', 240) or 0)
+    if style_ref_crop_frames > 0:
+        logger.info(f"Using fixed style reference crop: {style_ref_crop_frames} frames")
     collate_config = {}
     if device == 'mps':
         if fixed_mps_text_length > 0:
@@ -404,7 +431,7 @@ def main(config_path, dataset, name, resume):
         # load pretrained ASR model
         ASR_config = config.get("ASR_config", False)
         ASR_path = config.get("ASR_path", False)
-        text_aligner = load_ASR_models(ASR_path, ASR_config)
+        text_aligner = load_ASR_models(ASR_path, ASR_config, vocab_size=config['model_params']['n_token'])
 
         # load pretrained F0 model
         F0_path = config.get("F0_path", False)
@@ -573,6 +600,7 @@ def main(config_path, dataset, name, resume):
             torch.mps.empty_cache()
         running_loss = 0
         skipped_short_batches = 0
+        dropped_short_samples = 0
         start_time = time.time()
 
         _ = [model[key].train() for key in model]
@@ -583,6 +611,26 @@ def main(config_path, dataset, name, resume):
             ref_labels = batch[-1].to(device)
             batch = [b.to(device) for b in batch[1:-2]]
             texts, input_lengths, _, _, mels, mel_input_length, ref_mels = batch
+
+            if fixed_training_mel_len:
+                # Drop only the samples too short for the fixed crop window
+                # instead of skipping the whole batch. Batch-size variants are
+                # bounded by batch_size, so they cannot leak MPS graph shapes.
+                keep = (mel_input_length // 2) > (fixed_training_mel_len_frames + 1)
+                if not bool(keep.all()):
+                    if not bool(keep.any()):
+                        skipped_short_batches += 1
+                        continue
+                    keep_idx = keep.nonzero(as_tuple=True)[0]
+                    dropped_short_samples += len(waves) - keep_idx.numel()
+                    waves = [waves[k] for k in keep_idx.tolist()]
+                    labels = labels[keep_idx]
+                    ref_labels = ref_labels[keep_idx]
+                    texts = texts[keep_idx]
+                    input_lengths = input_lengths[keep_idx]
+                    mels = mels[keep_idx]
+                    mel_input_length = mel_input_length[keep_idx]
+                    ref_mels = ref_mels[keep_idx]
 
             with torch.no_grad():
                 aligner_width = mels.size(2) // (2**n_down)
@@ -635,10 +683,8 @@ def main(config_path, dataset, name, resume):
                 # Pin decoder/STFT/WavLM/MPD/MSD shapes on MPS. Variable mel_len
                 # creates distinct MPS graph variants that accumulate in
                 # driver/native memory.
+                # Too-short samples were already dropped at the top of the loop.
                 mel_len = fixed_training_mel_len_frames
-                if int(mel_input_length.min().item() / 2) <= mel_len + 1:
-                    skipped_short_batches += 1
-                    continue
             else:
                 mel_input_length_all = accelerator.gather(
                     mel_input_length
@@ -671,7 +717,9 @@ def main(config_path, dataset, name, resume):
                 gt = torch.stack([
                     mels[bib, :, (s0 * 2) : ((s0 + mel_len) * 2)] for bib, s0 in enumerate(starts)
                 ]).detach()
-            st = ref_mels.detach()  # Use actual reference from different clip
+            # Use actual reference from a different clip; the circular crop is
+            # padding-free and fixed-shape (see _style_ref_crop).
+            st = _style_ref_crop(ref_mels.detach(), style_ref_crop_frames)
 
             # clip too short to be used by the style encoder
             if gt.shape[-1] < 80:
@@ -799,10 +847,10 @@ def main(config_path, dataset, name, resume):
 
                 running_loss = 0
 
-        if skipped_short_batches and accelerator.is_main_process:
+        if (skipped_short_batches or dropped_short_samples) and accelerator.is_main_process:
             logger.info(
-                'Epoch=%d/%d skipped_short_batches=%d fixed_mel_len=%d'
-                % (epoch, epochs - 1, skipped_short_batches, fixed_training_mel_len_frames)
+                'Epoch=%d/%d skipped_short_batches=%d dropped_short_samples=%d fixed_mel_len=%d'
+                % (epoch, epochs - 1, skipped_short_batches, dropped_short_samples, fixed_training_mel_len_frames)
             )
 
         loss_test = 0
@@ -817,6 +865,20 @@ def main(config_path, dataset, name, resume):
                 waves = batch[0]
                 batch = [b.to(device) for b in batch[1:-2]]
                 texts, input_lengths, _, _, mels, mel_input_length, ref_mels = batch
+
+                if fixed_training_mel_len:
+                    # Same per-sample short-clip handling as training.
+                    keep = (mel_input_length // 2) > (fixed_training_mel_len_frames + 1)
+                    if not bool(keep.any()):
+                        continue
+                    if not bool(keep.all()):
+                        keep_idx = keep.nonzero(as_tuple=True)[0]
+                        waves = [waves[k] for k in keep_idx.tolist()]
+                        texts = texts[keep_idx]
+                        input_lengths = input_lengths[keep_idx]
+                        mels = mels[keep_idx]
+                        mel_input_length = mel_input_length[keep_idx]
+                        ref_mels = ref_mels[keep_idx]
 
                 with torch.no_grad():
                     aligner_width = mels.size(2) // (2**n_down)
@@ -853,10 +915,9 @@ def main(config_path, dataset, name, resume):
                 # get clips
                 if fixed_training_mel_len:
                     # Keep validation crops fixed-width too; validation runs on
-                    # the training device in Stage 1.
+                    # the training device in Stage 1. Too-short samples were
+                    # already dropped after unpacking.
                     mel_len = fixed_training_mel_len_frames
-                    if int(mel_input_length.min().item() / 2) <= mel_len + 1:
-                        continue
                 else:
                     mel_len = min(
                         [int(mel_input_length.min().item() / 2 - 1), max_len // 2]
@@ -887,7 +948,9 @@ def main(config_path, dataset, name, resume):
 
                 F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1))
                 s = model.style_encoder(
-                    ref_mels.detach().unsqueeze(1) if multispeaker else gt.unsqueeze(1)
+                    _style_ref_crop(ref_mels.detach(), style_ref_crop_frames, random_start=False).unsqueeze(1)
+                    if multispeaker
+                    else gt.unsqueeze(1)
                 )
                 real_norm = log_norm(gt.unsqueeze(1)).squeeze(1)
                 y_rec = model.decoder(en, F0_real, real_norm, s)
