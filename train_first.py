@@ -594,7 +594,7 @@ def main(config_path, dataset, name, resume):
     epoch_durations = []
     for epoch in range(start_epoch, epochs):
         if accelerator.is_main_process:
-            logger.info('========== epoch %d/%d ==========' % (epoch, epochs - 1))
+            log_print('========== epoch %d/%d ==========' % (epoch, epochs - 1), logger)
         if device == "mps":
             gc.collect()
             torch.mps.empty_cache()

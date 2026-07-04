@@ -753,7 +753,8 @@ def main(config_path, dataset, name, resume):
     epoch_durations = []
     warned_mps_mel_width = False
     for epoch in range(start_epoch, epochs):
-        logger.info('========== epoch %d/%d ==========' % (epoch, epochs - 1))
+        if accelerator.is_main_process:
+            log_print('========== epoch %d/%d ==========' % (epoch, epochs - 1), logger)
         if device == "mps":
             gc.collect()
             torch.mps.empty_cache()
