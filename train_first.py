@@ -227,6 +227,59 @@ def _length_to_text_mask(lengths, text_width):
     return _length_to_width_mask(lengths, text_width)
 
 
+def _pad_last(x, width, value=0):
+    if x.size(-1) == width:
+        return x
+    if x.size(-1) > width:
+        return x[..., :width]
+    return F.pad(x, (0, width - x.size(-1)), value=value)
+
+
+def _time_gather(x, starts, length):
+    '''Gather a fixed-width time crop with tensor starts, preserving gradients.'''
+    base = torch.arange(length, device=x.device, dtype=torch.long).unsqueeze(0)
+    idx = starts.to(x.device, dtype=torch.long).unsqueeze(1) + base
+    while idx.ndim < x.ndim:
+        idx = idx.unsqueeze(1)
+    idx = idx.expand(*x.shape[:-1], length)
+    return torch.gather(x, dim=-1, index=idx)
+
+
+def _crop_adversarial_audio(y, y_hat, segment_size):
+    '''Use a fixed waveform length for MPD/MSD/WavLM to avoid MPS graph-cache growth.'''
+    if not segment_size or segment_size <= 0:
+        return y, y_hat
+    length = min(y.size(-1), y_hat.size(-1))
+    if length > segment_size:
+        start = torch.randint(0, length - segment_size + 1, (), device='cpu').item()
+        return y[..., start:start + segment_size], y_hat[..., start:start + segment_size]
+    if length < segment_size:
+        pad = segment_size - length
+        return F.pad(y[..., :length], (0, pad)), F.pad(y_hat[..., :length], (0, pad))
+    return y[..., :length], y_hat[..., :length]
+
+
+def _s2s_loss(s2s_pred, texts, input_lengths):
+    '''Fixed-shape aligner sequence-to-sequence CE loss.
+
+    Equivalent to the original per-sample loop, but avoids variable-length
+    slices on the training device: each distinct text length compiles a
+    distinct MPS forward/backward graph that accumulates in driver memory.
+    '''
+    width = min(s2s_pred.size(1), texts.size(1))
+    batch = s2s_pred.size(0)
+    lengths = input_lengths.to(s2s_pred.device).clamp(max=width)
+    ce = F.cross_entropy(
+        s2s_pred[:, :width].reshape(-1, s2s_pred.size(-1)),
+        texts[:, :width].reshape(-1),
+        reduction='none',
+    ).view(batch, width)
+    pos = torch.arange(width, device=s2s_pred.device).unsqueeze(0)
+    valid = (pos < lengths.unsqueeze(1)).to(ce.dtype)
+    per_sample = (ce * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
+    return per_sample.sum() / batch
+
+
 @click.command()
 @click.option("-p", "--config_path", default="Configs/config.yml", type=str)
 @click.option('--dataset', type=str, default=None, help='Processed dataset directory from prepare_dataset.py')
@@ -271,6 +324,9 @@ def main(config_path, dataset, name, resume):
         prev_threads = torch.get_num_threads()
         torch.set_num_threads(1)
         logger.info(f"Set torch CPU threads: {prev_threads} -> {torch.get_num_threads()} for MPS native-heap pressure")
+        if bool(config.get('mps_native_lstm', False)):
+            set_mps_native_lstm(True)
+            logger.info('Using native MPS packed LSTMs (mps_native_lstm=true)')
     logger.info(f"Using device: {device}")
 
     epochs = config.get("epochs_1st", 200)
@@ -289,6 +345,33 @@ def main(config_path, dataset, name, resume):
 
     max_len = config.get("max_len", 200)
 
+    # MPS fixed-shape mitigations (same knobs as Stage 2): variable widths
+    # compile distinct MPS graph variants that accumulate in driver memory.
+    adversarial_segment_size = int(config.get("adversarial_segment_size", sr if device == "mps" else 0) or 0)
+    if adversarial_segment_size > 0:
+        logger.info(f"Using fixed MPD/MSD segment size: {adversarial_segment_size} samples")
+    slm_segment_size = int(config.get("slm_segment_size", sr if device == "mps" else 0) or 0)
+    if slm_segment_size > 0:
+        logger.info(f"Using fixed WavLM segment size: {slm_segment_size} samples")
+    fixed_training_mel_len = bool(config.get('fixed_training_mel_len', device == 'mps'))
+    fixed_training_mel_len_frames = int(config.get('fixed_training_mel_len_frames') or (max_len // 2))
+    fixed_training_mel_len_frames = min(fixed_training_mel_len_frames, max_len // 2)
+    if fixed_training_mel_len:
+        logger.info(f"Using fixed Stage 1 training mel length: {fixed_training_mel_len_frames} frames")
+    fixed_mps_text_length = int(config.get('fixed_mps_text_length', 0) or 0)
+    fixed_mps_mel_length = int(config.get('fixed_mps_mel_length', 0) or 0)
+    mps_safe_gather_crop = bool(config.get('mps_safe_gather_crop', device == 'mps'))
+    collate_config = {}
+    if device == 'mps':
+        if fixed_mps_text_length > 0:
+            collate_config['fixed_text_length'] = fixed_mps_text_length
+            logger.info(f"Using fixed MPS text pad length: {fixed_mps_text_length}")
+        if fixed_mps_mel_length > 0:
+            collate_config['fixed_mel_length'] = fixed_mps_mel_length
+            logger.info(f"Using fixed MPS mel pad length: {fixed_mps_mel_length}")
+        if mps_safe_gather_crop:
+            logger.info('Using tensor-gather crops for MPS-safe decoder windows')
+
     # load data
     train_list, val_list = get_data_path_list(train_path, val_path)
 
@@ -300,6 +383,7 @@ def main(config_path, dataset, name, resume):
         batch_size=batch_size,
         num_workers=num_workers,
         dataset_config={},
+        collate_config=collate_config,
         device=device,
     )
 
@@ -313,6 +397,7 @@ def main(config_path, dataset, name, resume):
         num_workers=0,
         device=device,
         dataset_config={},
+        collate_config=collate_config,
     )
 
     with accelerator.main_process_first():
@@ -487,6 +572,7 @@ def main(config_path, dataset, name, resume):
             gc.collect()
             torch.mps.empty_cache()
         running_loss = 0
+        skipped_short_batches = 0
         start_time = time.time()
 
         _ = [model[key].train() for key in model]
@@ -545,36 +631,47 @@ def main(config_path, dataset, name, resume):
                 asr = t_en @ s2s_attn_mono
 
             # get clips
-            mel_input_length_all = accelerator.gather(
-                mel_input_length
-            )  # for balanced load
-            mel_len = min(
-                [int(mel_input_length_all.min().item() / 2 - 1), max_len // 2]
-            )
+            if fixed_training_mel_len:
+                # Pin decoder/STFT/WavLM/MPD/MSD shapes on MPS. Variable mel_len
+                # creates distinct MPS graph variants that accumulate in
+                # driver/native memory.
+                mel_len = fixed_training_mel_len_frames
+                if int(mel_input_length.min().item() / 2) <= mel_len + 1:
+                    skipped_short_batches += 1
+                    continue
+            else:
+                mel_input_length_all = accelerator.gather(
+                    mel_input_length
+                )  # for balanced load
+                mel_len = min(
+                    [int(mel_input_length_all.min().item() / 2 - 1), max_len // 2]
+                )
 
-            en = []
-            gt = []
+            starts = []
             wav = []
 
             for bib in range(len(mel_input_length)):
                 mel_length = int(mel_input_length[bib].item() / 2)
 
                 random_start = np.random.randint(0, mel_length - mel_len)
-                en.append(asr[bib, :, random_start : random_start + mel_len])
-                gt.append(
-                    mels[bib, :, (random_start * 2) : ((random_start + mel_len) * 2)]
-                )
-
+                starts.append(int(random_start))
                 y = waves[bib][
                     (random_start * 2) * 300 : ((random_start + mel_len) * 2) * 300
                 ]
                 wav.append(torch.from_numpy(y).float().to(device))
 
-            en = torch.stack(en)
-            gt = torch.stack(gt).detach()
-            st = ref_mels.detach()  # Use actual reference from different clip
-
             wav = torch.stack(wav).float().detach()
+
+            if mps_safe_gather_crop:
+                starts_t = torch.as_tensor(starts, device=device, dtype=torch.long)
+                en = _time_gather(asr, starts_t, mel_len)
+                gt = _time_gather(mels, starts_t * 2, mel_len * 2).detach()
+            else:
+                en = torch.stack([asr[bib, :, s0 : s0 + mel_len] for bib, s0 in enumerate(starts)])
+                gt = torch.stack([
+                    mels[bib, :, (s0 * 2) : ((s0 + mel_len) * 2)] for bib, s0 in enumerate(starts)
+                ]).detach()
+            st = ref_mels.detach()  # Use actual reference from different clip
 
             # clip too short to be used by the style encoder
             if gt.shape[-1] < 80:
@@ -602,9 +699,11 @@ def main(config_path, dataset, name, resume):
 
             # discriminator loss
 
+            wav_g = wav.unsqueeze(1).float()
             if epoch >= TMA_epoch:
+                wav_adv, y_rec_adv = _crop_adversarial_audio(wav_g, y_rec, adversarial_segment_size)
                 optimizer.zero_grad()
-                d_loss = dl(wav.detach().unsqueeze(1).float(), y_rec.detach()).mean()
+                d_loss = dl(wav_adv.detach(), y_rec_adv.detach()).mean()
                 accelerator.backward(d_loss)
                 optimizer.step("msd")
                 optimizer.step("mpd")
@@ -616,19 +715,13 @@ def main(config_path, dataset, name, resume):
             loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
 
             if epoch >= TMA_epoch:  # start TMA training
-                loss_s2s = 0
-                for _s2s_pred, _text_input, _text_length in zip(
-                    s2s_pred, texts, input_lengths
-                ):
-                    loss_s2s += F.cross_entropy(
-                        _s2s_pred[:_text_length], _text_input[:_text_length]
-                    )
-                loss_s2s /= texts.size(0)
+                loss_s2s = _s2s_loss(s2s_pred, texts, input_lengths)
 
                 loss_mono = F.l1_loss(s2s_attn, s2s_attn_mono) * 10
 
-                loss_gen_all = gl(wav.detach().unsqueeze(1).float(), y_rec).mean()
-                loss_slm = wl(wav.detach(), y_rec).mean()
+                loss_gen_all = gl(wav_adv.detach(), y_rec_adv).mean()
+                wav_lm, y_rec_lm = _crop_adversarial_audio(wav_g.detach(), y_rec, slm_segment_size)
+                loss_slm = wl(wav_lm.squeeze(1), y_rec_lm.squeeze(1)).mean()
 
                 g_loss = (
                     loss_params.lambda_mel * loss_mel
@@ -661,6 +754,15 @@ def main(config_path, dataset, name, resume):
             if epoch >= TMA_epoch:
                 optimizer.step("text_aligner")
                 optimizer.step("pitch_extractor")
+
+            mps_cache_interval = config.get("mps_empty_cache_interval", 25)
+            if (
+                device == "mps"
+                and mps_cache_interval > 0
+                and (i + 1) % mps_cache_interval == 0
+            ):
+                gc.collect()
+                torch.mps.empty_cache()
 
             iters = iters + 1
 
@@ -696,6 +798,12 @@ def main(config_path, dataset, name, resume):
                 writer.add_scalar("train/speaker_margin_loss", timbre_margin_loss, iters)
 
                 running_loss = 0
+
+        if skipped_short_batches and accelerator.is_main_process:
+            logger.info(
+                'Epoch=%d/%d skipped_short_batches=%d fixed_mel_len=%d'
+                % (epoch, epochs - 1, skipped_short_batches, fixed_training_mel_len_frames)
+            )
 
         loss_test = 0
 
@@ -743,12 +851,16 @@ def main(config_path, dataset, name, resume):
                 asr = t_en @ s2s_attn
 
                 # get clips
-                mel_input_length_all = accelerator.gather(
-                    mel_input_length
-                )  # for balanced load
-                mel_len = min(
-                    [int(mel_input_length.min().item() / 2 - 1), max_len // 2]
-                )
+                if fixed_training_mel_len:
+                    # Keep validation crops fixed-width too; validation runs on
+                    # the training device in Stage 1.
+                    mel_len = fixed_training_mel_len_frames
+                    if int(mel_input_length.min().item() / 2) <= mel_len + 1:
+                        continue
+                else:
+                    mel_len = min(
+                        [int(mel_input_length.min().item() / 2 - 1), max_len // 2]
+                    )
 
                 en = []
                 gt = []
@@ -790,6 +902,10 @@ def main(config_path, dataset, name, resume):
             epoch_durations.append(epoch_duration)
             remaining_epochs = max(epochs - (epoch + 1), 0)
             eta = sum(epoch_durations) / len(epoch_durations) * remaining_epochs
+            if iters_test == 0:
+                logger.error('Validation produced no successful batches; keeping training alive with val_loss=inf')
+                loss_test = float('inf')
+                iters_test = 1
             log_print(
                 "Duration=%s ETA=%s Validation loss=%.6f"
                 % (_format_elapsed(epoch_duration), _format_eta(eta), loss_test / iters_test), logger

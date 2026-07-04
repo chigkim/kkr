@@ -16,6 +16,7 @@ fixed_training_mel_len_frames: 96  # near-original fixed decoder crop length; MP
 fixed_mps_text_length: 512         # pin text/predictor graph width on MPS
 fixed_mps_mel_length: 1152         # pin mel/attention graph width on MPS (covers VCTK max ~1060)
 mps_safe_gather_crop: true         # crop decoder windows via tensor gather instead of per-start strided slices
+mps_native_lstm: true              # run packed LSTMs natively on MPS (torch 2.7+) in both stages
 aligner_device: "mps"             # experiment: run text aligner on MPS
 wavlm_device: "mps"               # experiment: run WavLM perceptual loss on MPS
 discriminator_device: "mps"       # experiment: fallback discriminator device

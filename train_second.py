@@ -364,6 +364,9 @@ def main(config_path, dataset, name, resume):
         prev_threads = torch.get_num_threads()
         torch.set_num_threads(1)
         logger.info(f"Set torch CPU threads: {prev_threads} -> {torch.get_num_threads()} for MPS native-heap pressure")
+        if bool(config.get('mps_native_lstm', False)):
+            set_mps_native_lstm(True)
+            logger.info('Using native MPS packed LSTMs (mps_native_lstm=true)')
     logger.info(f"Using device: {device} (MPS Fallback: {os.environ.get('PYTORCH_ENABLE_MPS_FALLBACK', '0')})")
     eval_device = config.get("eval_device", "cpu" if device == "mps" else device)
     if eval_device != device:

@@ -12,6 +12,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+_MPS_NATIVE_LSTM = os.environ.get('STYLETTS2_MPS_NATIVE_LSTM', '0') == '1'
+
+
+def set_mps_native_lstm(enabled):
+    '''Run packed LSTMs natively on MPS instead of the CPU workaround.
+
+    The CPU workaround predates torch 2.7+; newer MPS backends handle
+    packed/variable-length LSTMs without the old graph churn.
+    '''
+    global _MPS_NATIVE_LSTM
+    _MPS_NATIVE_LSTM = bool(enabled)
+
+
 def _run_lstm_avoiding_mps_packed(lstm, x, lengths=None):
     '''Run LSTM on CPU when the caller is on MPS.
 
@@ -20,13 +33,19 @@ def _run_lstm_avoiding_mps_packed(lstm, x, lengths=None):
     training crawl and grow unified-memory pressure.  CPU LSTM is faster and more
     stable for these small recurrent blocks; autograd copies gradients back to the
     MPS input and leaves the LSTM parameters trainable on CPU.
+
+    With set_mps_native_lstm(True), the LSTM stays on MPS (torch 2.7+).
     '''
     original_device = x.device
-    use_cpu_lstm = original_device.type == 'mps'
+    use_cpu_lstm = original_device.type == 'mps' and not _MPS_NATIVE_LSTM
     if use_cpu_lstm:
         if next(lstm.parameters()).device.type != 'cpu':
             lstm.to('cpu')
         x = x.to('cpu')
+    elif next(lstm.parameters()).device != original_device:
+        # A checkpoint load or an earlier CPU-workaround call may have left the
+        # weights elsewhere; keep them with the input.
+        lstm.to(original_device)
 
     total_length = None
     if lengths is not None:
