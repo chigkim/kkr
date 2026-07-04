@@ -23,6 +23,14 @@ STEP_RE = re.compile(
     r'DiscLM(?: Loss)?[:=] ?(?P<disclm>[0-9.]+).*?'
     r'GenLM(?: Loss)?[:=] ?(?P<genlm>[0-9.]+)'
 )
+NEW_STEP_RE = re.compile(
+    r'(?P<time>\d\d:\d\d:\d\d).*?'
+    r'Step (?P<step>\d+)/(?:\d+):.*?'
+    r'LM=(?P<lm>[0-9.]+).*?'
+    r'DiscLM=(?P<disclm>[0-9.]+).*?'
+    r'GenLM=(?P<genlm>[0-9.]+)'
+)
+EPOCH_RE = re.compile(r'(?P<time>\d\d:\d\d:\d\d).*?=+ epoch (?P<epoch>\d+)/(?:\d+) =+')
 MPS_RE = re.compile(r'MPS:? cur=(?P<cur>[0-9.]+)G? drv=(?P<drv>[0-9.]+)G?')
 VAL_RE = re.compile(
     r'(?P<time>\d\d:\d\d:\d\d).*?Validation loss[:=] ?(?P<val>[0-9.]+), Dur loss[:=] ?(?P<dur>[0-9.]+), F0 loss[:=] ?(?P<f0>[0-9.]+)'
@@ -40,44 +48,68 @@ def parse_log(path: Path):
     if not path.exists():
         return [], []
     lines = path.read_text(errors='ignore').splitlines()
-    start = 0
+    starts = [0]
     for i, line in enumerate(lines):
         if 'WavLM loss enabled; SLM adversarial updates disabled' in line or 'SLM adversarial enabled' in line:
-            start = i
-    rows = []
-    vals = []
-    pending = None
-    for line in lines[start:]:
-        m = STEP_RE.search(line)
-        if m:
-            d = m.groupdict()
-            pending = {
-                'time': d['time'],
-                'epoch': int(d['epoch']),
-                'step': int(d['step']),
-                'lm': float(d['lm']),
-                'disclm': float(d['disclm']),
-                'genlm': float(d['genlm']),
-            }
+            starts.append(i)
+
+    def parse_from(start: int):
+        rows = []
+        vals = []
+        pending = None
+        current_epoch = None
+        for line in lines[start:]:
+            em = EPOCH_RE.search(line)
+            if em:
+                current_epoch = int(em.group('epoch'))
+                continue
+
+            m = STEP_RE.search(line)
+            if not m:
+                m = NEW_STEP_RE.search(line)
+            if m:
+                d = m.groupdict()
+                epoch = int(d['epoch']) if d.get('epoch') is not None else current_epoch
+                if epoch is None:
+                    continue
+                pending = {
+                    'time': d['time'],
+                    'epoch': epoch,
+                    'step': int(d['step']),
+                    'lm': float(d['lm']),
+                    'disclm': float(d['disclm']),
+                    'genlm': float(d['genlm']),
+                }
+                mm = MPS_RE.search(line)
+                if mm:
+                    pending['cur'] = float(mm.group('cur'))
+                    pending['drv'] = float(mm.group('drv'))
+                    rows.append(pending)
+                    pending = None
+                continue
+
             mm = MPS_RE.search(line)
-            if mm:
+            if mm and pending is not None:
                 pending['cur'] = float(mm.group('cur'))
                 pending['drv'] = float(mm.group('drv'))
                 rows.append(pending)
                 pending = None
-            continue
-        mm = MPS_RE.search(line)
-        if mm and pending is not None:
-            pending['cur'] = float(mm.group('cur'))
-            pending['drv'] = float(mm.group('drv'))
-            rows.append(pending)
-            pending = None
-            continue
-        m = VAL_RE.search(line)
-        if m:
-            d = m.groupdict()
-            vals.append((d['time'], float(d['val']), float(d['dur']), float(d['f0'])))
-    return rows, vals
+                continue
+
+            m = VAL_RE.search(line)
+            if m:
+                d = m.groupdict()
+                vals.append((d['time'], float(d['val']), float(d['dur']), float(d['f0'])))
+        return rows, vals
+
+    # Prefer the latest run that has step rows. If the current process has only
+    # printed startup/epoch lines so far, fall back to the previous run instead
+    # of showing an empty report.
+    for start in reversed(starts):
+        rows, vals = parse_from(start)
+        if rows:
+            return rows, vals
+    return parse_from(0)
 
 
 def print_log_report(rows, vals, tail: int):

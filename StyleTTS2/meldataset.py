@@ -177,12 +177,14 @@ class Collater(object):
       adaptive_batch_size (bool): if true, decrease batch size when long data comes.
     """
 
-    def __init__(self, return_wave=False):
+    def __init__(self, return_wave=False, fixed_text_length=None, fixed_mel_length=None):
         self.text_pad_index = 0
         self.min_mel_length = 192
         self.max_mel_length = 192
         self.text_bucket_stride = 64
         self.mel_bucket_stride = 64
+        self.fixed_text_length = fixed_text_length
+        self.fixed_mel_length = fixed_mel_length
         self.return_wave = return_wave
 
     def _bucket_length(self, length, stride):
@@ -210,6 +212,14 @@ class Collater(object):
         max_mel_length = self._bucket_mel_length(max([b[1].shape[1] for b in batch]))
         max_text_length = self._bucket_text_length(max([b[2].shape[0] for b in batch]))
         max_rtext_length = self._bucket_text_length(max([b[3].shape[0] for b in batch]))
+        fixed_mel_length = getattr(self, 'fixed_mel_length', None)
+        fixed_text_length = getattr(self, 'fixed_text_length', None)
+        if fixed_mel_length:
+            max_mel_length = max(max_mel_length, int(fixed_mel_length))
+        if fixed_text_length:
+            fixed_text_length = int(fixed_text_length)
+            max_text_length = max(max_text_length, fixed_text_length)
+            max_rtext_length = max(max_rtext_length, fixed_text_length)
 
         labels = torch.zeros((batch_size)).long()
         mels = torch.zeros((batch_size, nmels, max_mel_length)).float()

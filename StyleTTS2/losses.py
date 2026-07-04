@@ -161,18 +161,25 @@ class GeneratorLoss(torch.nn.Module):
         self.msd = msd
         
     def forward(self, y, y_hat):
-        disc_device = _module_device(self.mpd)
-        if disc_device is not None and y.device != disc_device:
-            y = y.to(disc_device)
-            y_hat = y_hat.to(disc_device)
-        y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self.mpd(y, y_hat, real_no_grad=True)
-        y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self.msd(y, y_hat, real_no_grad=True)
-        loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
-        loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
+        out_device = y_hat.device
+        mpd_device = _module_device(self.mpd)
+        msd_device = _module_device(self.msd)
+
+        y_mpd = y.to(mpd_device) if mpd_device is not None and y.device != mpd_device else y
+        y_hat_mpd = y_hat.to(mpd_device) if mpd_device is not None and y_hat.device != mpd_device else y_hat
+        y_msd = y.to(msd_device) if msd_device is not None and y.device != msd_device else y
+        y_hat_msd = y_hat.to(msd_device) if msd_device is not None and y_hat.device != msd_device else y_hat
+
+        y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self.mpd(y_mpd, y_hat_mpd, real_no_grad=True)
+        y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self.msd(y_msd, y_hat_msd, real_no_grad=True)
+        loss_fm_f = feature_loss(fmap_f_r, fmap_f_g).to(out_device)
+        loss_fm_s = feature_loss(fmap_s_r, fmap_s_g).to(out_device)
         loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
         loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
+        loss_gen_f = loss_gen_f.to(out_device)
+        loss_gen_s = loss_gen_s.to(out_device)
 
-        loss_rel = generator_TPRLS_loss(y_df_hat_r, y_df_hat_g) + generator_TPRLS_loss(y_ds_hat_r, y_ds_hat_g)
+        loss_rel = generator_TPRLS_loss(y_df_hat_r, y_df_hat_g).to(out_device) + generator_TPRLS_loss(y_ds_hat_r, y_ds_hat_g).to(out_device)
         
         loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_rel
         
@@ -186,21 +193,26 @@ class DiscriminatorLoss(torch.nn.Module):
         self.msd = msd
         
     def forward(self, y, y_hat):
-        disc_device = _module_device(self.mpd)
-        if disc_device is not None and y.device != disc_device:
-            y = y.to(disc_device)
-            y_hat = y_hat.to(disc_device)
+        out_device = y_hat.device
+        mpd_device = _module_device(self.mpd)
+        msd_device = _module_device(self.msd)
+
+        y_mpd = y.to(mpd_device) if mpd_device is not None and y.device != mpd_device else y
+        y_hat_mpd = y_hat.to(mpd_device) if mpd_device is not None and y_hat.device != mpd_device else y_hat
+        y_msd = y.to(msd_device) if msd_device is not None and y.device != msd_device else y
+        y_hat_msd = y_hat.to(msd_device) if msd_device is not None and y_hat.device != msd_device else y_hat
+
         # MPD
-        y_df_hat_r, y_df_hat_g, _, _ = self.mpd(y, y_hat)
+        y_df_hat_r, y_df_hat_g, _, _ = self.mpd(y_mpd, y_hat_mpd)
         loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
         # MSD
-        y_ds_hat_r, y_ds_hat_g, _, _ = self.msd(y, y_hat)
+        y_ds_hat_r, y_ds_hat_g, _, _ = self.msd(y_msd, y_hat_msd)
         loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
         
-        loss_rel = discriminator_TPRLS_loss(y_df_hat_r, y_df_hat_g) + discriminator_TPRLS_loss(y_ds_hat_r, y_ds_hat_g)
+        loss_rel = discriminator_TPRLS_loss(y_df_hat_r, y_df_hat_g).to(out_device) + discriminator_TPRLS_loss(y_ds_hat_r, y_ds_hat_g).to(out_device)
 
 
-        d_loss = loss_disc_s + loss_disc_f + loss_rel
+        d_loss = loss_disc_s.to(out_device) + loss_disc_f.to(out_device) + loss_rel
         
         return d_loss.mean()
    

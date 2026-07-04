@@ -188,6 +188,24 @@ def _num_speakers_from_lists(*lists):
     return max(speaker_ids) + 1 if speaker_ids else 1
 
 
+def _pad_last(x, width, value=0):
+    if x.size(-1) == width:
+        return x
+    if x.size(-1) > width:
+        return x[..., :width]
+    return F.pad(x, (0, width - x.size(-1)), value=value)
+
+
+def _time_gather(x, starts, length):
+    '''Gather a fixed-width time crop with tensor starts, preserving gradients.'''
+    base = torch.arange(length, device=x.device, dtype=torch.long).unsqueeze(0)
+    idx = starts.to(x.device, dtype=torch.long).unsqueeze(1) + base
+    while idx.ndim < x.ndim:
+        idx = idx.unsqueeze(1)
+    idx = idx.expand(*x.shape[:-1], length)
+    return torch.gather(x, dim=-1, index=idx)
+
+
 def _crop_adversarial_audio(y, y_hat, segment_size):
     '''Use a fixed waveform length for MPD/MSD to avoid MPSGraph cache growth.'''
     if not segment_size or segment_size <= 0:
@@ -324,12 +342,18 @@ def main(config_path, dataset, name, resume):
     eval_device = config.get("eval_device", "cpu" if device == "mps" else device)
     if eval_device != device:
         logger.info(f"Using device: {eval_device} for validation and TensorBoard inference")
+    elif device == 'mps':
+        logger.warning('Validation on MPS can reintroduce variable crop MPSGraph cache growth; prefer eval_device=cpu')
     aligner_device = config.get("aligner_device", "cpu" if device == "mps" else device)
     if aligner_device != device:
         logger.info(f"Using device: {aligner_device} for text aligner to avoid variable-mel MPSGraph cache growth")
     discriminator_device = config.get("discriminator_device", device)
-    if discriminator_device != device:
-        logger.info(f"Using device: {discriminator_device} for MPD/MSD discriminators")
+    mpd_device = config.get("mpd_device", discriminator_device)
+    msd_device = config.get("msd_device", discriminator_device)
+    if mpd_device != device:
+        logger.info(f"Using device: {mpd_device} for MPD discriminator")
+    if msd_device != device:
+        logger.info(f"Using device: {msd_device} for MSD discriminator")
     wavlm_device = config.get("wavlm_device", "cpu" if device == "mps" else device)
     if slm_enabled and wavlm_device != device:
         logger.info(f"Using device: {wavlm_device} for frozen WavLM perceptual loss")
@@ -344,6 +368,19 @@ def main(config_path, dataset, name, resume):
     fixed_training_mel_len_frames = min(fixed_training_mel_len_frames, max_len // 2)
     if fixed_training_mel_len:
         logger.info(f"Using fixed Stage 2 training mel length: {fixed_training_mel_len_frames} frames")
+    fixed_mps_text_length = int(config.get('fixed_mps_text_length', 0) or 0)
+    fixed_mps_mel_length = int(config.get('fixed_mps_mel_length', 0) or 0)
+    mps_safe_gather_crop = bool(config.get('mps_safe_gather_crop', device == 'mps'))
+    collate_config = {}
+    if device == 'mps':
+        if fixed_mps_text_length > 0:
+            collate_config['fixed_text_length'] = fixed_mps_text_length
+            logger.info(f"Using fixed MPS text pad length: {fixed_mps_text_length}")
+        if fixed_mps_mel_length > 0:
+            collate_config['fixed_mel_length'] = fixed_mps_mel_length
+            logger.info(f"Using fixed MPS mel pad length: {fixed_mps_mel_length}")
+        if mps_safe_gather_crop:
+            logger.info('Using tensor-gather crops for MPS-safe decoder windows')
 
     train_dataloader = build_dataloader(
         train_list,
@@ -353,6 +390,7 @@ def main(config_path, dataset, name, resume):
         batch_size=batch_size,
         num_workers=num_workers,
         dataset_config={},
+        collate_config=collate_config,
         device=device,
     )
 
@@ -366,6 +404,7 @@ def main(config_path, dataset, name, resume):
         num_workers=0,
         device=device,
         dataset_config={},
+        collate_config=collate_config,
     )
 
     # load pretrained ASR model
@@ -408,7 +447,8 @@ def main(config_path, dataset, name, resume):
             )
         resume_epoch, resume_checkpoint = latest_checkpoint
         logger.info(
-            f"Resuming from latest second-stage checkpoint: {resume_checkpoint} (epoch {resume_epoch})"
+            f"Resuming from latest second-stage checkpoint: {resume_checkpoint} "
+            f"(epoch {resume_epoch})"
         )
 
     load_pretrained = resume_checkpoint is not None or (
@@ -459,11 +499,12 @@ def main(config_path, dataset, name, resume):
     if 'prosody_speaker_classifier' in model or 'prosody_speaker_centers' in model:
         logger.info(f'Enabled prosody speaker separation loss for {num_speakers} speakers')
 
-    if discriminator_device != device:
-        model.mpd.to(discriminator_device)
-        model.msd.to(discriminator_device)
-    gl = GeneratorLoss(model.mpd, model.msd).to(discriminator_device)
-    dl = DiscriminatorLoss(model.mpd, model.msd).to(discriminator_device)
+    if mpd_device != device:
+        model.mpd.to(mpd_device)
+    if msd_device != device:
+        model.msd.to(msd_device)
+    gl = GeneratorLoss(model.mpd, model.msd)
+    dl = DiscriminatorLoss(model.mpd, model.msd)
     wl = WavLMLoss(model_params.slm.model, model.wd, sr, model_params.slm.sr).to(wavlm_device) if slm_enabled else None
 
     if device == "cuda":
@@ -535,7 +576,7 @@ def main(config_path, dataset, name, resume):
         )
         if not load_only_params:
             start_epoch += 1
-            logger.info(f"Resuming second-stage training from epoch {start_epoch}")
+            logger.info(f"Resuming second-stage training from epoch {start_epoch}/{epochs - 1}")
         # Ensure all modules are in train() mode after loading
         # (load_checkpoint sets them to eval(), which breaks spectral_norm)
         _ = [model[key].train() for key in model]
@@ -646,14 +687,17 @@ def main(config_path, dataset, name, resume):
         _ = [model[key].to(device) for key in model]
         if aligner_device != device:
             model.text_aligner.to(aligner_device)
-        if discriminator_device != device:
-            model.mpd.to(discriminator_device)
-            model.msd.to(discriminator_device)
+        if mpd_device != device:
+            model.mpd.to(mpd_device)
+        if msd_device != device:
+            model.msd.to(msd_device)
     _ = [model[key].train() for key in model]
     # ─────────────────────────────────────────────────────────────────────────
 
     epoch_durations = []
+    warned_mps_mel_width = False
     for epoch in range(start_epoch, epochs):
+        logger.info('========== epoch %d/%d ==========' % (epoch, epochs - 1))
         if device == "mps":
             gc.collect()
             torch.mps.empty_cache()
@@ -867,21 +911,13 @@ def main(config_path, dataset, name, resume):
                     continue
             else:
                 mel_len = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
-            en = []
-            gt = []
-            p_en = []
+            starts = []
             wav = []
 
             for bib in range(len(mel_input_length)):
                 mel_length = int(mel_input_length[bib].item() / 2)
-
                 random_start = np.random.randint(0, mel_length - mel_len)
-                en.append(asr[bib, :, random_start : random_start + mel_len])
-                p_en.append(p[bib, :, random_start : random_start + mel_len])
-                gt.append(
-                    mels[bib, :, (random_start * 2) : ((random_start + mel_len) * 2)]
-                )
-
+                starts.append(int(random_start))
                 y = waves[bib][
                     (random_start * 2) * 300 : ((random_start + mel_len) * 2) * 300
                 ]
@@ -889,9 +925,26 @@ def main(config_path, dataset, name, resume):
 
             wav = torch.stack(wav).float().detach()
 
-            en = torch.stack(en)
-            p_en = torch.stack(p_en)
-            gt = torch.stack(gt).detach()
+            if mps_safe_gather_crop:
+                starts_t = torch.as_tensor(starts, device=device, dtype=torch.long)
+                source_mel_width = mels.size(-1)
+                source_asr_width = asr.size(-1)
+                if fixed_mps_mel_length > 0 and source_mel_width > fixed_mps_mel_length and not warned_mps_mel_width:
+                    logger.warning(
+                        'Batch mel width %d exceeds fixed_mps_mel_length=%d; consider increasing the fixed width to avoid extra MPS graph variants',
+                        source_mel_width,
+                        fixed_mps_mel_length,
+                    )
+                    warned_mps_mel_width = True
+                en = _time_gather(_pad_last(asr, source_asr_width), starts_t, mel_len)
+                p_en = _time_gather(_pad_last(p, source_asr_width), starts_t, mel_len)
+                gt = _time_gather(_pad_last(mels, source_mel_width), starts_t * 2, mel_len * 2).detach()
+            else:
+                en = torch.stack([asr[bib, :, s0 : s0 + mel_len] for bib, s0 in enumerate(starts)])
+                p_en = torch.stack([p[bib, :, s0 : s0 + mel_len] for bib, s0 in enumerate(starts)])
+                gt = torch.stack([
+                    mels[bib, :, (s0 * 2) : ((s0 + mel_len) * 2)] for bib, s0 in enumerate(starts)
+                ]).detach()
             st = ref_mels.detach()  # Use actual reference from different clip
 
             if gt.size(-1) < 80:
@@ -937,8 +990,8 @@ def main(config_path, dataset, name, resume):
 
             if start_ds:
                 wav_adv, y_rec_adv = _crop_adversarial_audio(wav, y_rec, adversarial_segment_size)
-                wav_adv_disc = wav_adv.detach().to(discriminator_device)
-                y_rec_adv_disc_detached = y_rec_adv.detach().to(discriminator_device)
+                wav_adv_disc = wav_adv.detach()
+                y_rec_adv_disc_detached = y_rec_adv.detach()
                 optimizer.zero_grad()
                 d_loss = dl(wav_adv_disc, y_rec_adv_disc_detached).mean()
                 d_loss.backward()
@@ -950,6 +1003,7 @@ def main(config_path, dataset, name, resume):
 
             # generator loss
             optimizer.zero_grad()
+            discriminator_params_frozen = False
 
             loss_mel = stft_loss(y_rec, wav)
             if loss_mel is not None and torch.isnan(loss_mel).any():
@@ -958,9 +1012,16 @@ def main(config_path, dataset, name, resume):
 
                 sys.exit(1)
             if start_ds:
+                # The generator adversarial loss must backprop through the
+                # discriminator stack to y_rec_adv, but discriminator parameter
+                # gradients are unused in this phase.  Disabling them avoids
+                # stale grad buffers, especially with split MPD/MSD devices.
+                for p_disc in list(model.mpd.parameters()) + list(model.msd.parameters()):
+                    p_disc.requires_grad_(False)
+                discriminator_params_frozen = True
                 loss_gen_all = gl(
-                    wav_adv.detach().to(discriminator_device),
-                    y_rec_adv.to(discriminator_device),
+                    wav_adv.detach(),
+                    y_rec_adv,
                 ).mean().to(device)
             else:
                 loss_gen_all = 0
@@ -1008,6 +1069,9 @@ def main(config_path, dataset, name, resume):
 
             running_loss += loss_mel.item()
             g_loss.backward()
+            if discriminator_params_frozen:
+                for p_disc in list(model.mpd.parameters()) + list(model.msd.parameters()):
+                    p_disc.requires_grad_(True)
 
             optimizer.step("bert_encoder")
             optimizer.step("bert")
@@ -1135,10 +1199,8 @@ def main(config_path, dataset, name, resume):
 
             if (i + 1) % log_interval == 0:
                 logger.info(
-                    "Epoch=%d/%d Step=%d/%d Loss=%.2f Disc=%.2f Dur=%.2f CE=%.2f Norm=%.2f F0=%.2f LM=%.2f Gen=%.2f Sty=%.2f Diff=%.2f DiscLM=%.2f GenLM=%.2f ProsodyCE=%.2f ProsodyCenter=%.2f SpkMargin=%.2f Elapsed=%s\n%s"
+                    "Step %d/%d: Loss=%.2f Disc=%.2f Dur=%.2f CE=%.2f Norm=%.2f F0=%.2f LM=%.2f Gen=%.2f Sty=%.2f Diff=%.2f DiscLM=%.2f GenLM=%.2f ProsodyCE=%.2f ProsodyCenter=%.2f SpkMargin=%.2f Elapsed=%s\n%s"
                     % (
-                        epoch + 1,
-                        epochs,
                         i + 1,
                         len(train_list) // batch_size,
                         running_loss / log_interval,
@@ -1182,7 +1244,7 @@ def main(config_path, dataset, name, resume):
         if skipped_short_batches or skipped_aligner_batches:
             logger.info(
                 'Epoch=%d/%d skipped_short_batches=%d skipped_aligner_batches=%d fixed_mel_len=%d'
-                % (epoch + 1, epochs, skipped_short_batches, skipped_aligner_batches, fixed_training_mel_len_frames)
+                % (epoch, epochs - 1, skipped_short_batches, skipped_aligner_batches, fixed_training_mel_len_frames)
             )
 
         loss_test = 0
@@ -1342,12 +1404,12 @@ def main(config_path, dataset, name, resume):
         remaining_epochs = max(epochs - (epoch + 1), 0)
         eta = sum(epoch_durations) / len(epoch_durations) * remaining_epochs
         logger.info(
-            "Epochs %d: Duration=%s ETA=%s Validation loss=%.6f, Dur loss=%.6f, F0 loss=%.6f"
-            % (epoch + 1, _format_elapsed(epoch_duration), _format_eta(eta), loss_test / iters_test, loss_align / iters_test, loss_f / iters_test)
+            "Duration=%s ETA=%s Validation loss=%.6f, Dur loss=%.6f, F0 loss=%.6f"
+            % (_format_elapsed(epoch_duration), _format_eta(eta), loss_test / iters_test, loss_align / iters_test, loss_f / iters_test)
         )
-        writer.add_scalar("eval/mel_loss", loss_test / iters_test, epoch + 1)
-        writer.add_scalar("eval/dur_loss", loss_align / iters_test, epoch + 1)
-        writer.add_scalar("eval/F0_loss", loss_f / iters_test, epoch + 1)
+        writer.add_scalar("eval/mel_loss", loss_test / iters_test, epoch)
+        writer.add_scalar("eval/dur_loss", loss_align / iters_test, epoch)
+        writer.add_scalar("eval/F0_loss", loss_f / iters_test, epoch)
 
         if epoch % saving_epoch == 0:
             val_loss = loss_test / iters_test
@@ -1391,10 +1453,10 @@ def main(config_path, dataset, name, resume):
             eval_device,
             n_samples=200,
         )
-        writer.add_scalar("voicepack/acoustic_norm", _acoustic_norm, epoch + 1)
-        writer.add_scalar("voicepack/prosodic_norm", _prosodic_norm, epoch + 1)
+        writer.add_scalar("voicepack/acoustic_norm", _acoustic_norm, epoch)
+        writer.add_scalar("voicepack/prosodic_norm", _prosodic_norm, epoch)
         logger.info(
-            f"Epoch {epoch + 1}: acoustic_norm={_acoustic_norm:.4f} prosodic_norm={_prosodic_norm:.4f}"
+            f"acoustic_norm={_acoustic_norm:.4f} prosodic_norm={_prosodic_norm:.4f}"
         )
         if _vp is not None and _test_tokens:
             _epoch_audio = run_kokoro_inference(
@@ -1402,15 +1464,16 @@ def main(config_path, dataset, name, resume):
             )
             for i, (text, audio) in enumerate(_epoch_audio):
                 writer.add_audio(
-                    f"inference/test_{i + 1:02d}", audio, epoch + 1, sample_rate=sr
+                    f"inference/test_{i + 1:02d}", audio, epoch, sample_rate=sr
                 )
         if eval_device != device:
             _ = [model[key].to(device) for key in model]
             if aligner_device != device:
                 model.text_aligner.to(aligner_device)
-            if discriminator_device != device:
-                model.mpd.to(discriminator_device)
-                model.msd.to(discriminator_device)
+            if mpd_device != device:
+                model.mpd.to(mpd_device)
+            if msd_device != device:
+                model.msd.to(msd_device)
             stft_loss = stft_loss.to(device)
         _ = [model[key].train() for key in model]
         # ─────────────────────────────────────────────────────────────────────

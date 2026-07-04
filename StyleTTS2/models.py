@@ -28,7 +28,9 @@ def _run_lstm_avoiding_mps_packed(lstm, x, lengths=None):
             lstm.to('cpu')
         x = x.to('cpu')
 
+    total_length = None
     if lengths is not None:
+        total_length = x.shape[1]
         x = nn.utils.rnn.pack_padded_sequence(
             x,
             lengths,
@@ -40,7 +42,11 @@ def _run_lstm_avoiding_mps_packed(lstm, x, lengths=None):
     x, hidden = lstm(x)
 
     if lengths is not None:
-        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
+        x, _ = nn.utils.rnn.pad_packed_sequence(
+            x,
+            batch_first=True,
+            total_length=total_length,
+        )
 
     if use_cpu_lstm:
         x = x.to(original_device)

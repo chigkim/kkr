@@ -12,10 +12,15 @@ mps_empty_cache_interval: 10       # prevent WavLM/SLM MPS cache from exhausting
 adversarial_segment_size: 16000    # fixed MPD/MSD crop avoids MPS graph-cache growth from variable audio lengths
 slm_segment_size: 16000            # fixed WavLM perceptual crop avoids variable-shape MPSGraph cache growth
 fixed_training_mel_len: true       # pin Stage 2 decoder/STFT clip length on MPS to avoid shape-cache growth
-fixed_training_mel_len_frames: 64  # reduce decoder peak on MPS; 96 still OOMed after joint_epoch as drv approached 45G
-aligner_device: "cpu"             # text aligner sees variable mel lengths; keep it off MPS to avoid graph-cache growth
-wavlm_device: "cpu"               # frozen WavLM loss sees many native allocations on MPS; keep perceptual loss off MPS
-discriminator_device: "cpu"       # MPD/MSD activation at joint_epoch otherwise pushes MPS driver memory over the edge
+fixed_training_mel_len_frames: 96  # near-original fixed decoder crop length; MPS shape leak is mitigated by fixed padding/gather crops
+fixed_mps_text_length: 512         # pin text/predictor graph width on MPS
+fixed_mps_mel_length: 1152         # pin mel/attention graph width on MPS (covers VCTK max ~1060)
+mps_safe_gather_crop: true         # crop decoder windows via tensor gather instead of per-start strided slices
+aligner_device: "mps"             # experiment: run text aligner on MPS
+wavlm_device: "mps"               # experiment: run WavLM perceptual loss on MPS
+discriminator_device: "mps"       # experiment: fallback discriminator device
+mpd_device: "mps"                 # experiment: run MPD on MPS
+msd_device: "mps"                 # experiment: run MSD on MPS
 pretrained_model: "training/kokoro_base.pth"
 # Stage 2 loads first_stage_path; Stage 1 writes final_first_stage_path at the end.
 # Keep final_first_stage_path separate so the final checkpoint cannot overwrite best_1st.pth.
@@ -103,7 +108,7 @@ loss_params:
   lambda_s2s: 1.0                   # sequence-to-sequence loss
   lambda_mono: 1.0                  # monotonic alignment loss
   lambda_slm: 1.0                   # WavLM perceptual loss
-  slmadv_enabled: false             # Disable SLM adversarial on MPS; patched path still grows memory
+  slmadv_enabled: true              # experiment: enable SLM adversarial on MPS
   lambda_diff: 0.0                  # diffusion loss (0 = disabled, no diffusion)
   lambda_sty: 0.0                   # style reconstruction (0 = disabled)
   lambda_timbre_spk: 0.1            # Stage 1: speaker CE loss on style_encoder timbre vector

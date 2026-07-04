@@ -390,7 +390,8 @@ def main(config_path, dataset, name, resume):
             )
         resume_epoch, resume_checkpoint = latest_checkpoint
         logger.info(
-            f"Resuming from latest first-stage checkpoint: {resume_checkpoint} (epoch {resume_epoch})"
+            f"Resuming from latest first-stage checkpoint: {resume_checkpoint} "
+            f"(epoch {resume_epoch})"
         )
 
     with accelerator.main_process_first():
@@ -415,7 +416,7 @@ def main(config_path, dataset, name, resume):
                 except Exception:
                     logger.warning("Could not load best Stage 1 validation loss from %s", best_source)
                 start_epoch += 1
-                logger.info(f"Resuming first-stage training from epoch {start_epoch}")
+                logger.info(f"Resuming first-stage training from epoch {start_epoch}/{epochs - 1}")
         else:
             start_epoch = 0
             iters = 0
@@ -423,7 +424,7 @@ def main(config_path, dataset, name, resume):
     if start_epoch >= epochs:
         if accelerator.is_main_process:
             print(
-                f"No Stage 1 epochs left to run: checkpoint resumes at epoch {start_epoch}, "
+                f"No Stage 1 epochs left to run: next epoch would be {start_epoch}/{epochs - 1}, "
                 f"but epochs_1st is {epochs}. Increase epochs_1st in the config to continue."
             )
         return
@@ -480,6 +481,8 @@ def main(config_path, dataset, name, resume):
 
     epoch_durations = []
     for epoch in range(start_epoch, epochs):
+        if accelerator.is_main_process:
+            logger.info('========== epoch %d/%d ==========' % (epoch, epochs - 1))
         if device == "mps":
             gc.collect()
             torch.mps.empty_cache()
@@ -663,10 +666,8 @@ def main(config_path, dataset, name, resume):
 
             if (i + 1) % log_interval == 0 and accelerator.is_main_process:
                 log_print(
-                    "Epoch=%d/%d Step=%d/%d Mel=%.2f Gen=%.2f Disc=%.2f Mono=%.2f S2S=%.2f SLM=%.2f TimbreCE=%.2f TimbreCenter=%.2f SpkMargin=%.2f Elapsed=%s\n%s"
+                    "Step %d/%d: Mel=%.2f Gen=%.2f Disc=%.2f Mono=%.2f S2S=%.2f SLM=%.2f TimbreCE=%.2f TimbreCenter=%.2f SpkMargin=%.2f Elapsed=%s\n%s"
                     % (
-                        epoch + 1,
-                        epochs,
                         i + 1,
                         len(train_list) // batch_size,
                         running_loss / log_interval,
@@ -790,10 +791,10 @@ def main(config_path, dataset, name, resume):
             remaining_epochs = max(epochs - (epoch + 1), 0)
             eta = sum(epoch_durations) / len(epoch_durations) * remaining_epochs
             log_print(
-                "Epochs %d: Duration=%s ETA=%s Validation loss=%.6f"
-                % (epoch + 1, _format_elapsed(epoch_duration), _format_eta(eta), loss_test / iters_test), logger
+                "Duration=%s ETA=%s Validation loss=%.6f"
+                % (_format_elapsed(epoch_duration), _format_eta(eta), loss_test / iters_test), logger
             )
-            writer.add_scalar("eval/mel_loss", loss_test / iters_test, epoch + 1)
+            writer.add_scalar("eval/mel_loss", loss_test / iters_test, epoch)
             attn_image = get_image(s2s_attn[0].cpu().numpy().squeeze())
             writer.add_figure("eval/attn", attn_image, epoch)
 
@@ -830,10 +831,10 @@ def main(config_path, dataset, name, resume):
                 device,
                 n_samples=200,
             )
-            writer.add_scalar("voicepack/acoustic_norm", _acoustic_norm, epoch + 1)
-            writer.add_scalar("voicepack/prosodic_norm", _prosodic_norm, epoch + 1)
+            writer.add_scalar("voicepack/acoustic_norm", _acoustic_norm, epoch)
+            writer.add_scalar("voicepack/prosodic_norm", _prosodic_norm, epoch)
             logger.info(
-                f"Epoch {epoch + 1}: acoustic_norm={_acoustic_norm:.4f} prosodic_norm={_prosodic_norm:.4f}"
+                f"acoustic_norm={_acoustic_norm:.4f} prosodic_norm={_prosodic_norm:.4f}"
             )
             if _vp is not None and _test_tokens:
                 _epoch_audio = run_kokoro_inference(
@@ -843,7 +844,7 @@ def main(config_path, dataset, name, resume):
                     writer.add_audio(
                         f"inference/test_{i + 1:02d}",
                         audio,
-                        epoch + 1,
+                        epoch,
                         sample_rate=sr,
                     )
             _ = [model[key].train() for key in model]
