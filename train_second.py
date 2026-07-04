@@ -273,6 +273,32 @@ def _length_to_text_mask(lengths, text_width):
     return _length_to_width_mask(lengths, text_width)
 
 
+def _duration_losses(d, d_gt, input_lengths):
+    '''Fixed-shape duration L1 and CE losses.
+
+    Equivalent to the original per-sample loop, but avoids variable-length
+    slices on the training device: each distinct text length compiles a
+    distinct MPS forward/backward graph that accumulates in driver memory.
+    '''
+    batch, text_width, max_dur = d.shape
+    lengths = input_lengths.to(d.device)
+    dur_tgt = d_gt.to(d.device).to(d.dtype)
+
+    pos = torch.arange(text_width, device=d.device).unsqueeze(0)
+    valid = (pos < lengths.unsqueeze(1)).to(d.dtype)
+    inner = ((pos >= 1) & (pos < (lengths - 1).unsqueeze(1))).to(d.dtype)
+
+    dur_pred = torch.sigmoid(d).sum(dim=-1)
+    loss_dur = ((dur_pred - dur_tgt).abs() * inner).sum(dim=1) / inner.sum(dim=1).clamp(min=1)
+
+    frame = torch.arange(max_dur, device=d.device).view(1, 1, max_dur)
+    s2s_trg = (frame < dur_tgt.unsqueeze(-1)).to(d.dtype)
+    ce = F.binary_cross_entropy_with_logits(d, s2s_trg, reduction='none').mean(dim=-1)
+    loss_ce = (ce * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
+
+    return loss_dur.sum() / batch, loss_ce.sum() / batch
+
+
 @click.command()
 @click.option("-p", "--config_path", default="Configs/config.yml", type=str)
 @click.option('--dataset', type=str, default=None, help='Processed dataset directory from prepare_dataset.py')
@@ -1034,25 +1060,7 @@ def main(config_path, dataset, name, resume):
             else:
                 loss_lm = 0
 
-            loss_ce = 0
-            loss_dur = 0
-            for _s2s_pred, _text_input, _text_length in zip(d, (d_gt), input_lengths):
-                _s2s_pred = _s2s_pred[:_text_length, :]
-                _text_input = _text_input[:_text_length].long()
-                _s2s_trg = torch.zeros_like(_s2s_pred)
-                for p in range(_s2s_trg.shape[0]):
-                    _s2s_trg[p, : _text_input[p]] = 1
-                _dur_pred = torch.sigmoid(_s2s_pred).sum(axis=1)
-
-                loss_dur += F.l1_loss(
-                    _dur_pred[1 : _text_length - 1], _text_input[1 : _text_length - 1]
-                )
-                loss_ce += F.binary_cross_entropy_with_logits(
-                    _s2s_pred.flatten(), _s2s_trg.flatten()
-                )
-
-            loss_ce /= texts.size(0)
-            loss_dur /= texts.size(0)
+            loss_dur, loss_ce = _duration_losses(d, d_gt, input_lengths)
 
             g_loss = (
                 loss_params.lambda_mel * loss_mel
@@ -1254,6 +1262,10 @@ def main(config_path, dataset, name, resume):
             _ = [model[key].to(eval_device) for key in model]
             stft_loss = stft_loss.to(eval_device)
         _ = [model[key].eval() for key in model]
+        # When the whole model is moved to eval_device, the text aligner moves
+        # with it; keep feeding it there instead of the training-time
+        # aligner_device (which may be MPS in all-MPS experiments).
+        val_aligner_device = eval_device if eval_device != device else aligner_device
 
         with torch.no_grad():
             iters_test = 0
@@ -1273,18 +1285,18 @@ def main(config_path, dataset, name, resume):
                         ref_mels,
                     ) = batch
                     with torch.no_grad():
-                        aligner_mels = mels.detach().to(aligner_device)
+                        aligner_mels = mels.detach().to(val_aligner_device)
                         aligner_width = aligner_mels.size(2) // (2**n_down)
                         mask = _length_to_width_mask(
-                            mel_input_length.to(aligner_device) // (2**n_down),
+                            mel_input_length.to(val_aligner_device) // (2**n_down),
                             aligner_width,
-                        ).to(aligner_device)
+                        ).to(val_aligner_device)
                         text_mask = _length_to_text_mask(input_lengths, texts.size(1)).to(texts.device)
 
                         _, _, s2s_attn = model.text_aligner(
                             aligner_mels,
                             mask,
-                            texts.to(aligner_device),
+                            texts.to(val_aligner_device),
                         )
                         s2s_attn = s2s_attn.transpose(-1, -2)
                         s2s_attn = s2s_attn[..., 1:]
@@ -1403,6 +1415,10 @@ def main(config_path, dataset, name, resume):
         epoch_durations.append(epoch_duration)
         remaining_epochs = max(epochs - (epoch + 1), 0)
         eta = sum(epoch_durations) / len(epoch_durations) * remaining_epochs
+        if iters_test == 0:
+            logger.error('Validation produced no successful batches; keeping training alive with val_loss=inf')
+            loss_test = float('inf')
+            iters_test = 1
         logger.info(
             "Duration=%s ETA=%s Validation loss=%.6f, Dur loss=%.6f, F0 loss=%.6f"
             % (_format_elapsed(epoch_duration), _format_eta(eta), loss_test / iters_test, loss_align / iters_test, loss_f / iters_test)

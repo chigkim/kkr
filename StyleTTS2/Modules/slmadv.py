@@ -60,7 +60,12 @@ class SLMAdversarialLoss(torch.nn.Module):
         s_trg,
         ref_s=None,
     ):
-        text_mask = length_to_mask(ref_lengths).to(ref_text.device)
+        # Build the mask at the padded/bucketed ref_text width, not
+        # ref_lengths.max(): with fixed-width collation they differ, and the
+        # narrower mask both breaks BERT/predictor shapes and reintroduces
+        # per-batch dynamic widths on MPS.
+        text_width = ref_text.size(1)
+        text_mask = length_to_mask(ref_lengths, text_width).to(ref_text.device)
         bert_dur = self.model.bert(ref_text, attention_mask=(~text_mask).int())
         d_en = self.model.bert_encoder(bert_dur).transpose(-1, -2)
 
@@ -96,7 +101,7 @@ class SLMAdversarialLoss(torch.nn.Module):
             d_en,
             s_dur,
             ref_lengths,
-            torch.randn(ref_lengths.shape[0], ref_lengths.max(), 2).to(ref_text.device),
+            torch.randn(ref_lengths.shape[0], text_width, 2).to(ref_text.device),
             text_mask,
         )
 
@@ -137,12 +142,15 @@ class SLMAdversarialLoss(torch.nn.Module):
 
             output_lengths.append(l)
 
-        max_len = max(output_lengths)
+        # Bucket the predicted alignment width: max(output_lengths) is unique
+        # nearly every step, and an exact-width attention/decoder graph would
+        # compile a fresh MPS graph variant each time.
+        max_len = ((max(output_lengths) + 63) // 64) * 64
 
         with torch.no_grad():
             t_en = self.model.text_encoder(ref_text, ref_lengths, text_mask)
 
-        s2s_attn = torch.zeros(len(ref_lengths), int(ref_lengths.max()), max_len).to(
+        s2s_attn = torch.zeros(len(ref_lengths), text_width, max_len).to(
             ref_text.device
         )
         for bib in range(len(output_lengths)):
@@ -278,9 +286,10 @@ class SLMAdversarialLoss(torch.nn.Module):
         return d_loss, gen_loss, y_pred.detach()
 
 
-def length_to_mask(lengths):
+def length_to_mask(lengths, width=None):
+    width = int(width) if width is not None else int(lengths.max())
     mask = (
-        torch.arange(lengths.max())
+        torch.arange(width)
         .unsqueeze(0)
         .expand(lengths.shape[0], -1)
         .type_as(lengths)

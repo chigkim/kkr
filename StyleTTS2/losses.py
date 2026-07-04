@@ -128,22 +128,26 @@ def generator_loss(disc_outputs):
     return loss, gen_losses
 
 """ https://dl.acm.org/doi/abs/10.1145/3573834.3574506 """
+def _TPRLS_term(dr, dg):
+    # Boolean-mask indexing has a data-dependent output shape, which compiles a
+    # new MPS graph variant on every step; use a fixed-shape masked mean instead.
+    tau = 0.04
+    diff = dr - dg
+    m_DG = torch.median(diff)
+    mask = (diff < m_DG).to(diff.dtype)
+    L_rel = (((diff - m_DG) ** 2) * mask).sum() / mask.sum().clamp(min=1)
+    return tau - F.relu(tau - L_rel)
+
 def discriminator_TPRLS_loss(disc_real_outputs, disc_generated_outputs):
     loss = 0
     for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
-        tau = 0.04
-        m_DG = torch.median((dr-dg))
-        L_rel = torch.mean((((dr - dg) - m_DG)**2)[dr < dg + m_DG])
-        loss += tau - F.relu(tau - L_rel)
+        loss += _TPRLS_term(dr, dg)
     return loss
 
 def generator_TPRLS_loss(disc_real_outputs, disc_generated_outputs):
     loss = 0
     for dg, dr in zip(disc_real_outputs, disc_generated_outputs):
-        tau = 0.04
-        m_DG = torch.median((dr-dg))
-        L_rel = torch.mean((((dr - dg) - m_DG)**2)[dr < dg + m_DG])
-        loss += tau - F.relu(tau - L_rel)
+        loss += _TPRLS_term(dr, dg)
     return loss
 
 def _module_device(module):
