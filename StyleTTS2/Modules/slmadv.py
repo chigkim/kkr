@@ -113,7 +113,9 @@ class SLMAdversarialLoss(torch.nn.Module):
         # differentiable duration modeling
         conv_device = torch.device('cpu') if self.conv_on_cpu and ref_text.device.type == 'mps' else ref_text.device
         for _s2s_pred, _text_length in zip(d, ref_lengths):
-            _s2s_pred_org = _s2s_pred[:_text_length, :].to(conv_device)
+            # Move at the fixed padded width, slice on the conv device: a
+            # per-sample-length slice on MPS compiles one graph per length.
+            _s2s_pred_org = _s2s_pred.to(conv_device)[:_text_length, :]
 
             _s2s_pred = torch.sigmoid(_s2s_pred_org)
             _dur_pred = _s2s_pred.sum(axis=-1)
@@ -138,7 +140,7 @@ class SLMAdversarialLoss(torch.nn.Module):
                 padding=h.shape[-1] - 1,
                 groups=int(_text_length),
             )[..., :l]
-            attn_preds.append(F.softmax(out.squeeze(), dim=0).to(ref_text.device))
+            attn_preds.append(F.softmax(out.squeeze(), dim=0))
 
             output_lengths.append(l)
 
@@ -150,11 +152,16 @@ class SLMAdversarialLoss(torch.nn.Module):
         with torch.no_grad():
             t_en = self.model.text_encoder(ref_text, ref_lengths, text_mask)
 
-        s2s_attn = torch.zeros(len(ref_lengths), text_width, max_len).to(
-            ref_text.device
+        # Assemble on the conv device: the per-sample (text_len x pred_len)
+        # copies have near-unique shapes every step (pred_len drifts with the
+        # model), so on MPS they grow the graph cache without bound. One
+        # bucketed fixed-shape transfer afterwards is cache-stable.
+        s2s_attn = torch.zeros(
+            len(ref_lengths), text_width, max_len, device=conv_device
         )
         for bib in range(len(output_lengths)):
             s2s_attn[bib, : ref_lengths[bib], : output_lengths[bib]] = attn_preds[bib]
+        s2s_attn = s2s_attn.to(ref_text.device)
 
         asr_pred = t_en @ s2s_attn
 
@@ -168,12 +175,9 @@ class SLMAdversarialLoss(torch.nn.Module):
 
         # get clips
 
-        en = []
-        p_en = []
+        sel = []
+        pred_starts = []
         sp = []
-
-        F0_fakes = []
-        N_fakes = []
 
         wav = []
 
@@ -185,10 +189,8 @@ class SLMAdversarialLoss(torch.nn.Module):
                 continue
 
             sp.append(s_preds[bib])
-
-            random_start = np.random.randint(0, mel_length_pred - mel_len)
-            en.append(asr_pred[bib, :, random_start : random_start + mel_len])
-            p_en.append(p_pred[bib, :, random_start : random_start + mel_len])
+            sel.append(bib)
+            pred_starts.append(np.random.randint(0, mel_length_pred - mel_len))
 
             # get ground truth clips
             random_start = np.random.randint(0, mel_length_gt - mel_len)
@@ -205,8 +207,17 @@ class SLMAdversarialLoss(torch.nn.Module):
 
         sp = torch.stack(sp)
         wav = torch.stack(wav).float()
-        en = torch.stack(en)
-        p_en = torch.stack(p_en)
+        # Fixed-shape gather crops: narrow slices at random starts compile a
+        # new MPS graph per offset; gather keeps one graph per (n, width).
+        sel_idx = torch.tensor(sel, device=ref_text.device)
+        starts = torch.tensor(pred_starts, device=ref_text.device)
+        idx = (starts.unsqueeze(1) + torch.arange(mel_len, device=ref_text.device)).unsqueeze(1)
+        en = torch.gather(
+            asr_pred[sel_idx], -1, idx.expand(-1, asr_pred.size(1), -1)
+        )
+        p_en = torch.gather(
+            p_pred[sel_idx], -1, idx.expand(-1, p_pred.size(1), -1)
+        )
 
         F0_fake, N_fake = self.model.predictor.F0Ntrain(p_en, sp[:, 128:])
         y_pred = self.model.decoder(en, F0_fake, N_fake, sp[:, :128])
