@@ -13,6 +13,7 @@ import soundfile as sf
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / 'kokoro'))
 
 from kokoro import KModel, KPipeline
@@ -37,7 +38,7 @@ def main():
     parser.add_argument('--model', default=None, help='Already converted Kokoro weights; skips conversion if provided')
     parser.add_argument('--voices-dir', default='voices/vctk_samples', help='Directory containing speaker .pt voicepacks')
     parser.add_argument('--speakers', default='p239,p261,p303,p307', help='Comma-separated speaker IDs')
-    parser.add_argument('--config', default='training/config.json', help='Kokoro config.json')
+    parser.add_argument('--config', default='dataset/config.json', help='Kokoro config.json (prepare_dataset.py emits one with the expanded vocab)')
     parser.add_argument('--output-dir', default='generated/vctk_samples', help='Output directory')
     parser.add_argument('--lang-code', default='en-us', help='Language code. For --g2p-backend phonemizer, use a phonemizer/espeak language such as en-us, en-gb, de, fr-fr.')
     parser.add_argument('--g2p-backend', default='kokoro', choices=['kokoro', 'phonemizer'], help='Inference G2P backend; use phonemizer to match phonemizer/espeak training lists')

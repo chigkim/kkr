@@ -27,6 +27,32 @@ VAL_RATIO = 0.05
 RANDOM_SEED = 42
 
 
+def split_by_speaker(entries, val_ratio, seed):
+    '''Return train/val entries with validation sampled independently per speaker.'''
+    rng = random.Random(seed)
+    by_speaker = {}
+    for entry in entries:
+        speaker_id = entry[2]
+        by_speaker.setdefault(speaker_id, []).append(entry)
+
+    train_entries = []
+    val_entries = []
+    for speaker_id in sorted(by_speaker):
+        speaker_entries = list(by_speaker[speaker_id])
+        rng.shuffle(speaker_entries)
+        if len(speaker_entries) <= 1:
+            n_val = 0
+        else:
+            n_val = max(1, int(len(speaker_entries) * val_ratio))
+            n_val = min(n_val, len(speaker_entries) - 1)
+        val_entries.extend(speaker_entries[:n_val])
+        train_entries.extend(speaker_entries[n_val:])
+
+    rng.shuffle(train_entries)
+    rng.shuffle(val_entries)
+    return train_entries, val_entries
+
+
 def phonemize(texts, language, g2p_backend='phonemizer'):
     language = language.lower()
 
@@ -157,11 +183,7 @@ def main():
             continue
         entries.append((rel, ipa, speakers[row['speaker']], row['text']))
 
-    rng = random.Random(args.seed)
-    rng.shuffle(entries)
-    n_val = max(1, int(len(entries) * args.val_ratio))
-    val_entries = entries[:n_val]
-    train_entries = entries[n_val:]
+    train_entries, val_entries = split_by_speaker(entries, args.val_ratio, args.seed)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     train_path = args.out_dir / 'vctk_train_list.txt'
@@ -189,6 +211,7 @@ def main():
     print(f'Valid entries : {len(entries):,}')
     print(f'Missing wavs  : {missing:,}')
     print(f'Speakers      : {len(speakers):,}')
+    print(f'Split         : per-speaker random val_ratio={args.val_ratio:g} seed={args.seed}')
     print(f'Train         : {len(train_entries):,} -> {train_path}')
     print(f'Val           : {len(val_entries):,} -> {val_path}')
     print(f'OOD           : {ood_path}')

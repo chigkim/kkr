@@ -259,14 +259,19 @@ class WavLMLoss(torch.nn.Module):
         return floss.mean()
 
     def generator(self, y_rec):
+        from Modules.slmadv import mem_diag as _mem_diag
         if y_rec.ndim == 3:
             y_rec = y_rec.squeeze(1)
         self.wavlm.eval()
         y_rec_16 = self.resample(y_rec)
+        _mem_diag.mark('gen.resample')
         y_rec_embeddings = self.wavlm(input_values=y_rec_16, output_hidden_states=True).hidden_states
+        _mem_diag.mark('gen.wavlm_fwd')
         y_rec_embeddings = torch.stack(y_rec_embeddings, dim=1).transpose(-1, -2).flatten(start_dim=1, end_dim=2)
+        _mem_diag.mark('gen.stack_flatten')
         y_df_hat_g = self.wd(y_rec_embeddings)
         loss_gen = torch.mean((1-y_df_hat_g)**2)
+        _mem_diag.mark('gen.wd')
 
         return loss_gen
 

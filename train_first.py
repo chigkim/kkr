@@ -56,6 +56,7 @@ from utils import *
 from losses import *
 from optimizers import build_optimizer
 import time
+from tqdm import tqdm
 
 from accelerate import Accelerator
 from accelerate.utils import LoggerType
@@ -67,6 +68,39 @@ import logging
 from accelerate.logging import get_logger
 
 logger = get_logger(__name__, log_level="DEBUG")
+
+def _file_log(level, message, *args):
+    if args:
+        message = message % args
+    target_logger = getattr(logger, 'logger', logger)
+    record = target_logger.makeRecord(target_logger.name, level, __file__, 0, message, (), None)
+    for handler in target_logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            handler.handle(record)
+    return message
+
+
+def _print_and_log(level, message, *args):
+    message = _file_log(level, message, *args)
+    print(message)
+
+
+def log_info(message, *args):
+    _print_and_log(logging.INFO, message, *args)
+
+
+def log_warning(message, *args):
+    _print_and_log(logging.WARNING, message, *args)
+
+
+def log_error(message, *args):
+    _print_and_log(logging.ERROR, message, *args)
+
+
+def scalar_value(value):
+    if torch.is_tensor(value):
+        return float(value.detach().mean().item())
+    return float(value)
 
 
 def find_latest_first_stage_checkpoint(log_dir):
@@ -318,8 +352,6 @@ def main(config_path, dataset, name, resume):
     config = yaml.safe_load(open(config_path))
     _resolve_runtime_paths(config, config_path, dataset, name)
     symbols_config = apply_symbols_config(config, config_path)
-    if symbols_config:
-        print(f'Using symbols: {symbols_config[0]} ({symbols_config[1]} tokens)')
 
     log_dir = config["log_dir"]
     if not osp.exists(log_dir):
@@ -339,24 +371,26 @@ def main(config_path, dataset, name, resume):
         logging.Formatter("%(levelname)s:%(asctime)s: %(message)s")
     )
     logger.logger.addHandler(file_handler)
+    if symbols_config:
+        log_info(f'Using symbols: {symbols_config[0]} ({symbols_config[1]} tokens)')
 
     batch_size = config.get("batch_size", 10)
     device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
-    print(f"Using {device} device")
+    log_info(f"Using {device} device")
     if device == "mps":
         os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
         prev_threads = torch.get_num_threads()
         torch.set_num_threads(1)
-        logger.info(f"Set torch CPU threads: {prev_threads} -> {torch.get_num_threads()} for MPS native-heap pressure")
+        log_info(f"Set torch CPU threads: {prev_threads} -> {torch.get_num_threads()} for MPS native-heap pressure")
         if bool(config.get('mps_native_lstm', False)):
             set_mps_native_lstm(True)
-            logger.info('Using native MPS packed LSTMs (mps_native_lstm=true)')
-    logger.info(f"Using device: {device}")
+            log_info('Using native MPS packed LSTMs (mps_native_lstm=true)')
+    log_info(f"Using device: {device}")
 
     epochs = config.get("epochs_1st", 200)
-    save_freq = config.get("save_freq", 2)
+    save_freq = config.get("save_freq", 1)
     log_interval = config.get("log_interval", 10)
-    saving_epoch = config.get("save_freq", 2)
+    saving_epoch = config.get("save_freq", 1)
 
     data_params = config.get("data_params", None)
     sr = config["preprocess_params"].get("sr", 24000)
@@ -373,31 +407,31 @@ def main(config_path, dataset, name, resume):
     # compile distinct MPS graph variants that accumulate in driver memory.
     adversarial_segment_size = int(config.get("adversarial_segment_size", sr if device == "mps" else 0) or 0)
     if adversarial_segment_size > 0:
-        logger.info(f"Using fixed MPD/MSD segment size: {adversarial_segment_size} samples")
+        log_info(f"Using fixed MPD/MSD segment size: {adversarial_segment_size} samples")
     slm_segment_size = int(config.get("slm_segment_size", sr if device == "mps" else 0) or 0)
     if slm_segment_size > 0:
-        logger.info(f"Using fixed WavLM segment size: {slm_segment_size} samples")
+        log_info(f"Using fixed WavLM segment size: {slm_segment_size} samples")
     fixed_training_mel_len = bool(config.get('fixed_training_mel_len', device == 'mps'))
     fixed_training_mel_len_frames = int(config.get('fixed_training_mel_len_frames') or (max_len // 2))
     fixed_training_mel_len_frames = min(fixed_training_mel_len_frames, max_len // 2)
     if fixed_training_mel_len:
-        logger.info(f"Using fixed Stage 1 training mel length: {fixed_training_mel_len_frames} frames")
+        log_info(f"Using fixed Stage 1 training mel length: {fixed_training_mel_len_frames} frames")
     fixed_mps_text_length = int(config.get('fixed_mps_text_length', 0) or 0)
     fixed_mps_mel_length = int(config.get('fixed_mps_mel_length', 0) or 0)
     mps_safe_gather_crop = bool(config.get('mps_safe_gather_crop', device == 'mps'))
     style_ref_crop_frames = int(config.get('style_ref_crop_frames', 240) or 0)
     if style_ref_crop_frames > 0:
-        logger.info(f"Using fixed style reference crop: {style_ref_crop_frames} frames")
+        log_info(f"Using fixed style reference crop: {style_ref_crop_frames} frames")
     collate_config = {}
     if device == 'mps':
         if fixed_mps_text_length > 0:
             collate_config['fixed_text_length'] = fixed_mps_text_length
-            logger.info(f"Using fixed MPS text pad length: {fixed_mps_text_length}")
+            log_info(f"Using fixed MPS text pad length: {fixed_mps_text_length}")
         if fixed_mps_mel_length > 0:
             collate_config['fixed_mel_length'] = fixed_mps_mel_length
-            logger.info(f"Using fixed MPS mel pad length: {fixed_mps_mel_length}")
+            log_info(f"Using fixed MPS mel pad length: {fixed_mps_mel_length}")
         if mps_safe_gather_crop:
-            logger.info('Using tensor-gather crops for MPS-safe decoder windows')
+            log_info('Using tensor-gather crops for MPS-safe decoder windows')
 
     # load data
     train_list, val_list = get_data_path_list(train_path, val_path)
@@ -456,7 +490,7 @@ def main(config_path, dataset, name, resume):
     diffusion_enabled = loss_params.get('lambda_diff', 0) > 0 and loss_params.get('diff_epoch', 999) < epochs
     model = build_model(model_params, text_aligner, pitch_extractor, plbert, enable_diffusion=diffusion_enabled)
     if not diffusion_enabled:
-        logger.info('Diffusion model disabled; skipping diffusion module allocation')
+        log_info('Diffusion model disabled; skipping diffusion module allocation')
 
     num_speakers = int(config.get('num_speakers') or _num_speakers_from_lists(train_list, val_list))
     style_dim = int(config['model_params'].get('style_dim', 128))
@@ -465,7 +499,7 @@ def main(config_path, dataset, name, resume):
     if loss_params.get('lambda_timbre_center', 0) > 0 or loss_params.get('lambda_speaker_margin', 0) > 0:
         model['timbre_speaker_centers'] = SpeakerCenters(num_speakers, style_dim)
     if 'timbre_speaker_classifier' in model or 'timbre_speaker_centers' in model:
-        logger.info(f'Enabled timbre speaker separation loss for {num_speakers} speakers')
+        log_info(f'Enabled timbre speaker separation loss for {num_speakers} speakers')
 
     best_loss = float("inf")  # best test loss
     loss_train_record = list([])
@@ -501,7 +535,7 @@ def main(config_path, dataset, name, resume):
                 f"--resume was set, but no epoch_1st_*.pth checkpoints were found in {log_dir}"
             )
         resume_epoch, resume_checkpoint = latest_checkpoint
-        logger.info(
+        log_info(
             f"Resuming from latest first-stage checkpoint: {resume_checkpoint} "
             f"(epoch {resume_epoch})"
         )
@@ -524,18 +558,18 @@ def main(config_path, dataset, name, resume):
                 try:
                     best_value = torch.load(best_source, map_location="cpu").get("val_loss", best_loss)
                     best_loss = float(best_value.item() if torch.is_tensor(best_value) else best_value)
-                    logger.info("Loaded best Stage 1 validation loss %.6f from %s", best_loss, best_source)
+                    log_info("Loaded best Stage 1 validation loss %.6f from %s", best_loss, best_source)
                 except Exception:
-                    logger.warning("Could not load best Stage 1 validation loss from %s", best_source)
+                    log_warning("Could not load best Stage 1 validation loss from %s", best_source)
                 start_epoch += 1
-                logger.info(f"Resuming first-stage training from epoch {start_epoch}/{epochs - 1}")
+                log_info(f"Resuming first-stage training from epoch {start_epoch}/{epochs - 1}")
         else:
             start_epoch = 0
             iters = 0
 
     if start_epoch >= epochs:
         if accelerator.is_main_process:
-            print(
+            log_info(
                 f"No Stage 1 epochs left to run: next epoch would be {start_epoch}/{epochs - 1}, "
                 f"but epochs_1st is {epochs}. Increase epochs_1st in the config to continue."
             )
@@ -558,11 +592,11 @@ def main(config_path, dataset, name, resume):
         text_cleaner = TextCleaner()
         _test_tokens = prepare_test_tokens(text_cleaner)
         if _test_tokens:
-            logger.info(
+            log_info(
                 f"TensorBoard inference: prepared {len(_test_tokens)} test sentences"
             )
         else:
-            logger.warning(
+            log_warning(
                 "TensorBoard inference: no test sentences available (misaki/espeak not found?)"
             )
 
@@ -570,14 +604,14 @@ def main(config_path, dataset, name, resume):
         baseline_samples = config.get("tensorboard_baseline_samples", 200)
         if baseline_samples > 0:
             _ = [model[key].eval() for key in model]
-            logger.info("Extracting pretrained baseline voicepack for TensorBoard...")
+            log_info("Extracting pretrained baseline voicepack for TensorBoard...")
             _baseline_voicepack, _baseline_acoustic_norm, _baseline_prosodic_norm = (
                 extract_voicepack(model, root_path, device, n_samples=baseline_samples)
             )
             if _baseline_voicepack is not None:
                 writer.add_scalar("baseline/acoustic_norm", _baseline_acoustic_norm, 0)
                 writer.add_scalar("baseline/prosodic_norm", _baseline_prosodic_norm, 0)
-                logger.info(
+                log_info(
                     f"  acoustic_norm={_baseline_acoustic_norm:.4f}  prosodic_norm={_baseline_prosodic_norm:.4f}"
                 )
                 _baseline_audio = run_kokoro_inference(
@@ -585,16 +619,14 @@ def main(config_path, dataset, name, resume):
                 )
                 for i, (text, audio) in enumerate(_baseline_audio):
                     writer.add_audio(f"baseline/test_{i + 1:02d}", audio, 0, sample_rate=sr)
-                    logger.info(f"  baseline/test_{i + 1:02d}: {text[:60]}")
+                    log_info(f"  baseline/test_{i + 1:02d}: {text[:60]}")
             _ = [model[key].train() for key in model]
         else:
-            logger.info("Skipping TensorBoard baseline voicepack extraction")
+            log_info("Skipping TensorBoard baseline voicepack extraction")
     # ─────────────────────────────────────────────────────────────────────────
 
     epoch_durations = []
     for epoch in range(start_epoch, epochs):
-        if accelerator.is_main_process:
-            log_print('========== epoch %d/%d ==========' % (epoch, epochs - 1), logger)
         if device == "mps":
             gc.collect()
             torch.mps.empty_cache()
@@ -605,7 +637,15 @@ def main(config_path, dataset, name, resume):
 
         _ = [model[key].train() for key in model]
 
-        for i, batch in enumerate(train_dataloader):
+        train_progress = tqdm(
+            enumerate(train_dataloader),
+            total=len(train_dataloader),
+            desc='Epoch %d/%d' % (epoch, epochs - 1),
+            unit='step',
+            dynamic_ncols=True,
+            disable=not accelerator.is_main_process,
+        )
+        for i, batch in train_progress:
             waves = batch[0]
             labels = batch[-2].to(device)
             ref_labels = batch[-1].to(device)
@@ -814,13 +854,33 @@ def main(config_path, dataset, name, resume):
 
             iters = iters + 1
 
+            if accelerator.is_main_process:
+                train_progress.set_postfix(
+                    {
+                        'Mel': '%.2f' % scalar_value(loss_mel),
+                        'Gen': '%.2f' % scalar_value(loss_gen_all),
+                        'Disc': '%.2f' % scalar_value(d_loss),
+                        'Mono': '%.2f' % scalar_value(loss_mono),
+                        'S2S': '%.2f' % scalar_value(loss_s2s),
+                        'SLM': '%.2f' % scalar_value(loss_slm),
+                        'TimbreCE': '%.2f' % scalar_value(timbre_spk_ce),
+                        'TimbreCenter': '%.2f' % scalar_value(timbre_center_loss),
+                        'SpkMargin': '%.2f' % scalar_value(timbre_margin_loss),
+                        'MPS': _torch_memory_report_line(device).replace('MPS: ', ''),
+                    },
+                    refresh=True,
+                )
+
             if (i + 1) % log_interval == 0 and accelerator.is_main_process:
-                log_print(
+                avg_mel_loss = running_loss / log_interval
+                elapsed = _format_elapsed(time.time() - start_time)
+                memory_line = _torch_memory_report_line(device)
+                step_message = (
                     "Step %d/%d: Mel=%.2f Gen=%.2f Disc=%.2f Mono=%.2f S2S=%.2f SLM=%.2f TimbreCE=%.2f TimbreCenter=%.2f SpkMargin=%.2f Elapsed=%s\n%s"
                     % (
                         i + 1,
-                        len(train_list) // batch_size,
-                        running_loss / log_interval,
+                        len(train_dataloader),
+                        avg_mel_loss,
                         loss_gen_all,
                         d_loss,
                         loss_mono,
@@ -829,13 +889,28 @@ def main(config_path, dataset, name, resume):
                         timbre_spk_ce,
                         timbre_center_loss,
                         timbre_margin_loss,
-                        _format_elapsed(time.time() - start_time),
-                        _torch_memory_report_line(device),
-                    ),
-                    logger,
+                        elapsed,
+                        memory_line,
+                    )
+                )
+                _file_log(logging.INFO, step_message)
+                train_progress.set_postfix(
+                    {
+                        'Mel': '%.2f' % avg_mel_loss,
+                        'Gen': '%.2f' % scalar_value(loss_gen_all),
+                        'Disc': '%.2f' % scalar_value(d_loss),
+                        'Mono': '%.2f' % scalar_value(loss_mono),
+                        'S2S': '%.2f' % scalar_value(loss_s2s),
+                        'SLM': '%.2f' % scalar_value(loss_slm),
+                        'TimbreCE': '%.2f' % scalar_value(timbre_spk_ce),
+                        'TimbreCenter': '%.2f' % scalar_value(timbre_center_loss),
+                        'SpkMargin': '%.2f' % scalar_value(timbre_margin_loss),
+                        'MPS': memory_line.replace('MPS: ', ''),
+                    },
+                    refresh=True,
                 )
 
-                writer.add_scalar("train/mel_loss", running_loss / log_interval, iters)
+                writer.add_scalar("train/mel_loss", avg_mel_loss, iters)
                 writer.add_scalar("train/gen_loss", loss_gen_all, iters)
                 writer.add_scalar("train/d_loss", d_loss, iters)
                 writer.add_scalar("train/mono_loss", loss_mono, iters)
@@ -848,7 +923,7 @@ def main(config_path, dataset, name, resume):
                 running_loss = 0
 
         if (skipped_short_batches or dropped_short_samples) and accelerator.is_main_process:
-            logger.info(
+            log_info(
                 'Epoch=%d/%d skipped_short_batches=%d dropped_short_samples=%d fixed_mel_len=%d'
                 % (epoch, epochs - 1, skipped_short_batches, dropped_short_samples, fixed_training_mel_len_frames)
             )
@@ -966,23 +1041,21 @@ def main(config_path, dataset, name, resume):
             remaining_epochs = max(epochs - (epoch + 1), 0)
             eta = sum(epoch_durations) / len(epoch_durations) * remaining_epochs
             if iters_test == 0:
-                logger.error('Validation produced no successful batches; keeping training alive with val_loss=inf')
+                log_error('Validation produced no successful batches; keeping training alive with val_loss=inf')
                 loss_test = float('inf')
                 iters_test = 1
-            log_print(
-                "Duration=%s ETA=%s Validation loss=%.6f"
-                % (_format_elapsed(epoch_duration), _format_eta(eta), loss_test / iters_test), logger
+            log_info(
+                "ETA=%s Validation loss=%.6f"
+                % (_format_eta(eta), loss_test / iters_test)
             )
             writer.add_scalar("eval/mel_loss", loss_test / iters_test, epoch)
             attn_image = get_image(s2s_attn[0].cpu().numpy().squeeze())
             writer.add_figure("eval/attn", attn_image, epoch)
 
-            if epoch % saving_epoch == 0:
-                val_loss = loss_test / iters_test
-                is_best = val_loss < best_loss
-                if is_best:
-                    best_loss = val_loss
-                    logger.info("New best Stage 1 validation loss: %.6f", best_loss)
+            val_loss = loss_test / iters_test
+            is_best = val_loss < best_loss
+            should_save_epoch = epoch % saving_epoch == 0
+            if is_best or should_save_epoch:
                 state = {
                     "net": {key: model[key].state_dict() for key in model},
                     "optimizer": optimizer.state_dict(),
@@ -990,16 +1063,23 @@ def main(config_path, dataset, name, resume):
                     "val_loss": val_loss,
                     "epoch": epoch,
                 }
-                save_path = osp.join(log_dir, "epoch_1st_%05d.pth" % epoch)
-                atomic_torch_save(state, save_path)
                 best_path = osp.join(log_dir, config.get("best_first_stage_path", "best_1st.pth"))
+                save_path = None
+                if should_save_epoch:
+                    save_path = osp.join(log_dir, "epoch_1st_%05d.pth" % epoch)
+                    atomic_torch_save(state, save_path)
                 if is_best:
+                    best_loss = val_loss
                     atomic_torch_save(state, best_path)
+                    log_info("New best Stage 1 validation loss: %.6f at epoch %d" % (best_loss, epoch))
+                keep_paths = [best_path]
+                if save_path:
+                    keep_paths.append(save_path)
                 prune_checkpoints(
                     log_dir,
                     "epoch_1st_*.pth",
                     config.get("keep_last_checkpoints", 2),
-                    keep_paths=[save_path, best_path],
+                    keep_paths=keep_paths,
                 )
 
             # ── Kokoro-faithful TensorBoard inference (every epoch) ───────────
@@ -1012,7 +1092,7 @@ def main(config_path, dataset, name, resume):
             )
             writer.add_scalar("voicepack/acoustic_norm", _acoustic_norm, epoch)
             writer.add_scalar("voicepack/prosodic_norm", _prosodic_norm, epoch)
-            logger.info(
+            log_info(
                 f"acoustic_norm={_acoustic_norm:.4f} prosodic_norm={_prosodic_norm:.4f}"
             )
             if _vp is not None and _test_tokens:
@@ -1030,7 +1110,7 @@ def main(config_path, dataset, name, resume):
             # ───────────────────────────────────────────────────────────────────
 
     if accelerator.is_main_process:
-        print("Saving..")
+        log_info("Saving..")
         state = {
             "net": {key: model[key].state_dict() for key in model},
             "optimizer": optimizer.state_dict(),

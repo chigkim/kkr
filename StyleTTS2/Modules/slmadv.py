@@ -1,6 +1,60 @@
+import os
 import torch
 import numpy as np
 import torch.nn.functional as F
+
+
+class _MemDiag:
+    '''Per-section MPS driver-memory attribution for the slmadv leak hunt.
+
+    Enabled with SLMADV_MEM_DIAG=1. Each mark() synchronizes MPS (so async
+    kernels are charged to the right section) and accumulates the driver-memory
+    delta since the previous mark. Persistent growth (graph/executable cache)
+    shows up as a section whose cumulative total keeps climbing; transient
+    allocations net out near zero.
+    '''
+
+    def __init__(self):
+        self.enabled = os.environ.get('SLMADV_MEM_DIAG', '') == '1' and torch.backends.mps.is_available()
+        self.totals = {}
+        self.calls = 0
+        self._last = None
+
+    def _drv(self):
+        torch.mps.synchronize()
+        return torch.mps.driver_allocated_memory()
+
+    def start(self):
+        if not self.enabled:
+            return
+        self._last = self._drv()
+
+    def mark(self, name):
+        if not self.enabled or self._last is None:
+            return
+        now = self._drv()
+        self.totals[name] = self.totals.get(name, 0) + (now - self._last)
+        self._last = now
+
+    def step_end(self, log_every=25):
+        if not self.enabled:
+            return
+        self.calls += 1
+        if self.calls % log_every == 0:
+            parts = '  '.join(
+                '%s=%+.1f' % (k, v / 1e6)
+                for k, v in sorted(self.totals.items(), key=lambda kv: -kv[1])
+            )
+            line = '[slmadv-mem] calls=%d cumulative MB by section: %s' % (self.calls, parts)
+            print(line, flush=True)
+            try:
+                with open(os.environ.get('SLMADV_MEM_DIAG_FILE', 'slmadv_mem_diag.log'), 'a') as f:
+                    f.write(line + '\n')
+            except OSError:
+                pass
+
+
+mem_diag = _MemDiag()
 
 
 def _fit_audio(x, length):
@@ -64,10 +118,12 @@ class SLMAdversarialLoss(torch.nn.Module):
         # ref_lengths.max(): with fixed-width collation they differ, and the
         # narrower mask both breaks BERT/predictor shapes and reintroduces
         # per-batch dynamic widths on MPS.
+        mem_diag.start()
         text_width = ref_text.size(1)
         text_mask = length_to_mask(ref_lengths, text_width).to(ref_text.device)
         bert_dur = self.model.bert(ref_text, attention_mask=(~text_mask).int())
         d_en = self.model.bert_encoder(bert_dur).transpose(-1, -2)
+        mem_diag.mark('bert')
 
         if not self.diffusion_enabled:
             # Diffusion model was never trained — use ground-truth styles directly
@@ -94,6 +150,8 @@ class SLMAdversarialLoss(torch.nn.Module):
                     num_steps=num_steps,
                 ).squeeze(1)
 
+        mem_diag.mark('style_sample')
+
         s_dur = s_preds[:, 128:]
         s = s_preds[:, :128]
 
@@ -104,6 +162,7 @@ class SLMAdversarialLoss(torch.nn.Module):
             torch.randn(ref_lengths.shape[0], text_width, 2).to(ref_text.device),
             text_mask,
         )
+        mem_diag.mark('predictor_pass1')
 
         bib = 0
 
@@ -144,6 +203,8 @@ class SLMAdversarialLoss(torch.nn.Module):
 
             output_lengths.append(l)
 
+        mem_diag.mark('duration_conv_loop')
+
         # Bucket the predicted alignment width: max(output_lengths) is unique
         # nearly every step, and an exact-width attention/decoder graph would
         # compile a fresh MPS graph variant each time.
@@ -151,6 +212,7 @@ class SLMAdversarialLoss(torch.nn.Module):
 
         with torch.no_grad():
             t_en = self.model.text_encoder(ref_text, ref_lengths, text_mask)
+        mem_diag.mark('text_encoder')
 
         # Assemble on the conv device: the per-sample (text_len x pred_len)
         # copies have near-unique shapes every step (pred_len drifts with the
@@ -164,8 +226,10 @@ class SLMAdversarialLoss(torch.nn.Module):
         s2s_attn = s2s_attn.to(ref_text.device)
 
         asr_pred = t_en @ s2s_attn
+        mem_diag.mark('attn_assembly')
 
         _, p_pred = self.model.predictor(d_en, s_dur, ref_lengths, s2s_attn, text_mask)
+        mem_diag.mark('predictor_pass2')
 
         if self.fixed_mel_len is not None:
             mel_len = int(self.fixed_mel_len)
@@ -203,6 +267,8 @@ class SLMAdversarialLoss(torch.nn.Module):
                 break
 
         if len(sp) <= 1:
+            mem_diag.mark('clip_select')
+            mem_diag.step_end()
             return None
 
         sp = torch.stack(sp)
@@ -218,9 +284,11 @@ class SLMAdversarialLoss(torch.nn.Module):
         p_en = torch.gather(
             p_pred[sel_idx], -1, idx.expand(-1, p_pred.size(1), -1)
         )
+        mem_diag.mark('clip_select')
 
         F0_fake, N_fake = self.model.predictor.F0Ntrain(p_en, sp[:, 128:])
         y_pred = self.model.decoder(en, F0_fake, N_fake, sp[:, :128])
+        mem_diag.mark('decoder')
 
         fixed_crop_size = int(self.fixed_crop_size) if self.fixed_crop_size is not None else None
         if fixed_crop_size:
@@ -288,11 +356,14 @@ class SLMAdversarialLoss(torch.nn.Module):
                 ).mean()
         else:
             d_loss = 0
+        mem_diag.mark('slm_discriminator')
 
         # generator loss
         gen_loss = self.wl.generator(y_pred.squeeze(1))
 
         gen_loss = gen_loss.mean()
+        mem_diag.mark('slm_generator')
+        mem_diag.step_end()
 
         return d_loss, gen_loss, y_pred.detach()
 

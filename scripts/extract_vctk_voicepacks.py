@@ -59,6 +59,7 @@ def main():
     parser.add_argument('--output-dir', default=None, help='Output directory for .pt voicepacks')
     parser.add_argument('--num-samples', type=int, default=100, help='Number of WAVs per speaker to average')
     parser.add_argument('--device', default='cpu', choices=['auto', 'cpu', 'cuda'], help='Extraction device')
+    parser.add_argument('--style-mode', default='medoid', choices=['medoid', 'mean', 'mean-renorm'], help='How to combine per-utterance styles (plain mean dilutes speaker identity)')
     args = parser.parse_args()
 
     if args.stage == 'stage1':
@@ -86,6 +87,7 @@ def main():
             num_samples=args.num_samples,
             device=args.device,
             style_encoder_model=str(style_encoder_path),
+            style_mode=args.style_mode,
         )
 
     print(f'\nDone. Voicepacks saved to: {output_dir.relative_to(REPO_ROOT)}')

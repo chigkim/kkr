@@ -30,9 +30,21 @@ NEW_STEP_RE = re.compile(
     r'DiscLM=(?P<disclm>[0-9.]+).*?'
     r'GenLM=(?P<genlm>[0-9.]+)'
 )
+STAGE_STEP_RE = re.compile(
+    r'(?P<time>\d\d:\d\d:\d\d).*?'
+    r'Step (?P<step>\d+)/(?:\d+):.*?'
+    r'Mel=(?P<mel>[0-9.]+).*?'
+    r'Gen=(?P<gen>[0-9.]+).*?'
+    r'Disc=(?P<disc>[0-9.]+).*?'
+    r'Mono=(?P<mono>[0-9.]+).*?'
+    r'S2S=(?P<s2s>[0-9.]+).*?'
+    r'SLM=(?P<slm>[0-9.]+)'
+)
 EPOCH_RE = re.compile(r'(?P<time>\d\d:\d\d:\d\d).*?=+ epoch (?P<epoch>\d+)/(?:\d+) =+')
+EPOCH_PLAIN_RE = re.compile(r'=+ epoch (?P<epoch>\d+)/(?:\d+) =+')
 MPS_RE = re.compile(r'MPS:? cur=(?P<cur>[0-9.]+)G? drv=(?P<drv>[0-9.]+)G?')
-VAL_RE = re.compile(
+VAL_RE = re.compile(r'(?P<time>\d\d:\d\d:\d\d).*?Duration=.*?Validation loss=(?P<val>[0-9.]+)')
+VAL_DETAIL_RE = re.compile(
     r'(?P<time>\d\d:\d\d:\d\d).*?Validation loss[:=] ?(?P<val>[0-9.]+), Dur loss[:=] ?(?P<dur>[0-9.]+), F0 loss[:=] ?(?P<f0>[0-9.]+)'
 )
 
@@ -59,14 +71,18 @@ def parse_log(path: Path):
         pending = None
         current_epoch = None
         for line in lines[start:]:
-            em = EPOCH_RE.search(line)
+            em = EPOCH_RE.search(line) or EPOCH_PLAIN_RE.search(line)
             if em:
                 current_epoch = int(em.group('epoch'))
                 continue
 
             m = STEP_RE.search(line)
+            row_kind = 'lm'
             if not m:
                 m = NEW_STEP_RE.search(line)
+            if not m:
+                m = STAGE_STEP_RE.search(line)
+                row_kind = 'stage'
             if m:
                 d = m.groupdict()
                 epoch = int(d['epoch']) if d.get('epoch') is not None else current_epoch
@@ -76,10 +92,23 @@ def parse_log(path: Path):
                     'time': d['time'],
                     'epoch': epoch,
                     'step': int(d['step']),
-                    'lm': float(d['lm']),
-                    'disclm': float(d['disclm']),
-                    'genlm': float(d['genlm']),
+                    'kind': row_kind,
                 }
+                if row_kind == 'stage':
+                    pending.update({
+                        'mel': float(d['mel']),
+                        'gen': float(d['gen']),
+                        'disc': float(d['disc']),
+                        'mono': float(d['mono']),
+                        's2s': float(d['s2s']),
+                        'slm': float(d['slm']),
+                    })
+                else:
+                    pending.update({
+                        'lm': float(d['lm']),
+                        'disclm': float(d['disclm']),
+                        'genlm': float(d['genlm']),
+                    })
                 mm = MPS_RE.search(line)
                 if mm:
                     pending['cur'] = float(mm.group('cur'))
@@ -96,10 +125,15 @@ def parse_log(path: Path):
                 pending = None
                 continue
 
-            m = VAL_RE.search(line)
+            m = VAL_DETAIL_RE.search(line)
             if m:
                 d = m.groupdict()
                 vals.append((d['time'], float(d['val']), float(d['dur']), float(d['f0'])))
+                continue
+            m = VAL_RE.search(line)
+            if m:
+                d = m.groupdict()
+                vals.append((d['time'], float(d['val']), None, None))
         return rows, vals
 
     # Prefer the latest run that has step rows. If the current process has only
@@ -118,10 +152,16 @@ def print_log_report(rows, vals, tail: int):
         print('no step rows parsed')
         return
     for r in rows[-tail:]:
+        if r.get('kind') == 'stage':
+            losses = (
+                f"Mel={r['mel']:.2f} Gen={r['gen']:.2f} Disc={r['disc']:.2f} "
+                f"Mono={r['mono']:.2f} S2S={r['s2s']:.2f} SLM={r['slm']:.2f}"
+            )
+        else:
+            losses = f"LM={r['lm']:.2f} DLM={r['disclm']:.2f} GLM={r['genlm']:.2f}"
         print(
             f"{r['time']} e{r['epoch']} step{r['step']:3d} "
-            f"LM={r['lm']:.2f} DLM={r['disclm']:.2f} GLM={r['genlm']:.2f} "
-            f"cur={r['cur']:.2f} drv={r['drv']:.2f}"
+            f"{losses} cur={r['cur']:.2f} drv={r['drv']:.2f}"
         )
     first, last = rows[0], rows[-1]
     print(
@@ -142,17 +182,34 @@ def print_log_report(rows, vals, tail: int):
     if vals:
         print('validations:')
         for t, val, dur, f0 in vals[-8:]:
-            print(f'  {t} val={val:.6f} dur={dur:.6f} f0={f0:.6f}')
+            if dur is None or f0 is None:
+                print(f'  {t} val={val:.6f}')
+            else:
+                print(f'  {t} val={val:.6f} dur={dur:.6f} f0={f0:.6f}')
         best = min(vals, key=lambda x: x[1])
         print(f'best val: {best[1]:.6f} at {best[0]}')
 
 
-def find_train_pid(pattern: str) -> str | None:
+def find_train_process(pattern: str | None = None):
     ps = run(['ps', '-axo', 'pid,ppid,stat,%cpu,%mem,rss,vsz,etime,command'])
     matches = []
     for line in ps.splitlines():
-        if pattern in line and 'accelerate launch' not in line and 'report_training_status.py' not in line:
+        is_train = 'train_first.py' in line or 'train_second.py' in line
+        if pattern:
+            is_train = pattern in line
+        if is_train and 'accelerate launch' not in line and 'report_training_status.py' not in line:
             matches.append(line)
+    return matches
+
+
+def run_dir_from_process(line: str) -> Path | None:
+    m = re.search(r'--name\s+(\S+)', line)
+    if m:
+        return Path('runs') / m.group(1)
+    return None
+
+
+def print_train_process(matches) -> str | None:
     if matches:
         print('=== train process ===')
         for line in matches:
@@ -241,21 +298,24 @@ def print_footprint(pid: str):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--run-dir', default='runs/vctk_spksep')
+    p.add_argument('--run-dir', default=None)
     p.add_argument('--log', default=None)
-    p.add_argument('--pattern', default='train_second.py --config_path configs/config_vctk_ft.yml')
+    p.add_argument('--pattern', default=None)
     p.add_argument('--tail', type=int, default=20)
     p.add_argument('--top', type=int, default=8, help='number of top RSS processes to show')
     p.add_argument('--no-vmmap', action='store_true')
     p.add_argument('--no-footprint', action='store_true')
     args = p.parse_args()
 
-    log_path = Path(args.log) if args.log else Path(args.run_dir) / 'train.log'
+    matches = find_train_process(args.pattern)
+    detected_run_dir = run_dir_from_process(matches[0]) if matches else None
+    run_dir = Path(args.run_dir) if args.run_dir else detected_run_dir or Path('runs/vctk_spksep')
+    log_path = Path(args.log) if args.log else run_dir / 'train.log'
     print(f'log: {log_path}')
     rows, vals = parse_log(log_path)
     print_log_report(rows, vals, args.tail)
     print()
-    pid = find_train_pid(args.pattern)
+    pid = print_train_process(matches)
     print()
     print_system_memory()
     print()

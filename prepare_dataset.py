@@ -42,6 +42,32 @@ VAL_RATIO = 0.05
 RANDOM_SEED = 42
 
 
+def split_by_speaker(entries, val_ratio, seed):
+    '''Return train/val entries with validation sampled independently per speaker.'''
+    rng = random.Random(seed)
+    by_speaker = {}
+    for entry in entries:
+        speaker_id = entry[2]
+        by_speaker.setdefault(speaker_id, []).append(entry)
+
+    train_entries = []
+    val_entries = []
+    for speaker_id in sorted(by_speaker):
+        speaker_entries = list(by_speaker[speaker_id])
+        rng.shuffle(speaker_entries)
+        if len(speaker_entries) <= 1:
+            n_val = 0
+        else:
+            n_val = max(1, int(len(speaker_entries) * val_ratio))
+            n_val = min(n_val, len(speaker_entries) - 1)
+        val_entries.extend(speaker_entries[:n_val])
+        train_entries.extend(speaker_entries[n_val:])
+
+    rng.shuffle(train_entries)
+    rng.shuffle(val_entries)
+    return train_entries, val_entries
+
+
 def discover_rows(dataset_root: Path, extensions):
     rows = []
     for wav_path in sorted(dataset_root.rglob('*')):
@@ -107,11 +133,7 @@ def main():
             continue
         entries.append((row['file'], ipa, speakers[row['speaker']], row['text'], row['language'], row['speaker']))
 
-    rng = random.Random(args.seed)
-    rng.shuffle(entries)
-    n_val = max(1, int(len(entries) * args.val_ratio))
-    val_entries = entries[:n_val]
-    train_entries = entries[n_val:]
+    train_entries, val_entries = split_by_speaker(entries, args.val_ratio, args.seed)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     train_path = args.out_dir / 'train.txt'
@@ -155,6 +177,23 @@ def main():
         }, f, indent=2, ensure_ascii=False)
         f.write('\n')
 
+    # Emit an inference-ready Kokoro config with the expanded vocab so KModel
+    # can load checkpoints trained on this dataset (base config has n_token=178).
+    inference_config_path = args.out_dir / 'config.json'
+    base_config_path = Path(__file__).resolve().parent / 'training' / 'config.json'
+    if base_config_path.exists():
+        with open(base_config_path, encoding='utf-8') as f:
+            inference_config = json.load(f)
+        inference_config['n_token'] = len(expanded_symbols)
+        for index, symbol in enumerate(added_symbols, start=len(base_symbols)):
+            inference_config['vocab'][symbol] = index
+        with open(inference_config_path, 'w', encoding='utf-8') as f:
+            json.dump(inference_config, f, indent=2, ensure_ascii=False)
+            f.write('\n')
+    else:
+        print(f'WARNING: {base_config_path} not found; skipping inference config')
+        inference_config_path = None
+
     with open(manifest_path, 'w', encoding='utf-8') as f:
         json.dump({
             'dataset': str(args.dataset),
@@ -164,13 +203,18 @@ def main():
             'speakers': speakers,
             'num_entries': len(entries),
             'symbols': str(symbols_path),
+            'inference_config': str(inference_config_path) if inference_config_path else None,
             'base_vocab_size': len(base_symbols),
             'vocab_size': len(expanded_symbols),
             'added_symbols': added_symbols,
+            'split_strategy': 'per_speaker',
+            'val_ratio': args.val_ratio,
+            'seed': args.seed,
         }, f, indent=2, ensure_ascii=False)
         f.write('\n')
 
     print(f'Valid entries : {len(entries):,}')
+    print(f'Split         : per-speaker random val_ratio={args.val_ratio:g} seed={args.seed}')
     print(f'Train         : {len(train_entries):,} -> {train_path}')
     print(f'Val           : {len(val_entries):,} -> {val_path}')
     print(f'OOD           : {ood_path}')
@@ -178,6 +222,8 @@ def main():
     print(f'Symbols       : {symbols_path} ({len(expanded_symbols)} symbols, +{len(added_symbols)})')
     if added_symbols:
         print(f'Added symbols : {" ".join(added_symbols)}')
+    if inference_config_path:
+        print(f'Infer config  : {inference_config_path} (pass as --config for Kokoro inference)')
     print(f'Manifest      : {manifest_path}')
     print(f'Set config data_params.root_path to: {args.dataset}')
 
