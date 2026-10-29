@@ -239,11 +239,19 @@ class WavLMLoss(torch.nn.Module):
         self.wavlm.eval()
         return self
 
+    def _to_wavlm_device(self, *tensors):
+        # WavLM may live on another device (wavlm_device); .to() keeps autograd
+        # so gradients still reach generated audio on the training device.
+        wavlm_device = _module_device(self.wavlm)
+        return [t.to(wavlm_device) if wavlm_device is not None and t.device != wavlm_device else t for t in tensors]
+
     def forward(self, wav, y_rec):
         if wav.ndim == 3:
             wav = wav.squeeze(1)
         if y_rec.ndim == 3:
             y_rec = y_rec.squeeze(1)
+        out_device = y_rec.device
+        wav, y_rec = self._to_wavlm_device(wav, y_rec)
 
         self.wavlm.eval()
         with torch.no_grad():
@@ -256,12 +264,14 @@ class WavLMLoss(torch.nn.Module):
         for er, eg in zip(wav_embeddings, y_rec_embeddings):
             floss += torch.mean(torch.abs(er - eg))
 
-        return floss.mean()
+        return floss.mean().to(out_device)
 
     def generator(self, y_rec):
         from Modules.slmadv import mem_diag as _mem_diag
         if y_rec.ndim == 3:
             y_rec = y_rec.squeeze(1)
+        out_device = y_rec.device
+        (y_rec,) = self._to_wavlm_device(y_rec)
         self.wavlm.eval()
         y_rec_16 = self.resample(y_rec)
         _mem_diag.mark('gen.resample')
@@ -273,13 +283,15 @@ class WavLMLoss(torch.nn.Module):
         loss_gen = torch.mean((1-y_df_hat_g)**2)
         _mem_diag.mark('gen.wd')
 
-        return loss_gen
+        return loss_gen.to(out_device)
 
     def discriminator(self, wav, y_rec):
         if wav.ndim == 3:
             wav = wav.squeeze(1)
         if y_rec.ndim == 3:
             y_rec = y_rec.squeeze(1)
+        out_device = y_rec.device
+        wav, y_rec = self._to_wavlm_device(wav, y_rec)
 
         self.wavlm.eval()
         with torch.no_grad():
@@ -301,11 +313,13 @@ class WavLMLoss(torch.nn.Module):
 
         loss_disc_f = r_loss + g_loss
 
-        return loss_disc_f.mean()
+        return loss_disc_f.mean().to(out_device)
 
     def discriminator_forward(self, wav):
         if wav.ndim == 3:
             wav = wav.squeeze(1)
+        out_device = wav.device
+        (wav,) = self._to_wavlm_device(wav)
         self.wavlm.eval()
         with torch.no_grad():
             wav_16 = self.resample(wav)
@@ -314,4 +328,4 @@ class WavLMLoss(torch.nn.Module):
 
         y_d_rs = self.wd(y_embeddings)
 
-        return y_d_rs
+        return y_d_rs.to(out_device)

@@ -254,6 +254,20 @@ def _crop_adversarial_audio(y, y_hat, segment_size):
     return y[..., :length], y_hat[..., :length]
 
 
+def _resolve_aux_device(name, configured, device):
+    '''Fall back to the training device when a config pins another backend.
+
+    The VCTK config pins aux modules to "mps"; on a CUDA or CPU machine that
+    backend is unavailable, so use the training device instead.
+    '''
+    configured = str(configured)
+    backend = configured.split(':')[0]
+    if backend in ('mps', 'cuda') and backend != str(device).split(':')[0]:
+        log_warning(f"{name}={configured} does not match training device {device}; using {device}")
+        return device
+    return configured
+
+
 def _style_ref_crop(ref_mels, crop_frames, random_start=True):
     '''Fixed-width circular time crop for style/prosody encoder inputs.
 
@@ -263,9 +277,14 @@ def _style_ref_crop(ref_mels, crop_frames, random_start=True):
     inference, where styles come from unpadded mels.  A circular crop inside
     the true length keeps the shape fixed and never shows padding.  True
     lengths are recovered from the content: padded frames are exactly zero.
+
+    crop_frames <= 0 fills the whole input width by tiling the true-length
+    content from its start, so the encoder sees the full utterance and no
+    padding.
     '''
     if not crop_frames or crop_frames <= 0:
-        return ref_mels
+        crop_frames = ref_mels.size(-1)
+        random_start = False
     crop_frames = int(crop_frames)
     lengths = (ref_mels.abs().sum(dim=1) > 0).sum(dim=-1).clamp(min=1)
     if random_start:
@@ -358,7 +377,7 @@ def _duration_losses(d, d_gt, input_lengths):
 
 
 @click.command()
-@click.option("-p", "--config_path", default="Configs/config.yml", type=str)
+@click.option("-p", "--config_path", default="configs/config_vctk_ft.yml", type=str)
 @click.option('--dataset', type=str, default=None, help='Processed dataset directory from prepare_dataset.py')
 @click.option('-name', '-n', '--name', type=str, default=None, help='Run/output name; saves checkpoints and logs under runs/<name>')
 @click.option(
@@ -426,22 +445,22 @@ def main(config_path, dataset, name, resume):
             set_mps_native_lstm(True)
             log_info('Using native MPS packed LSTMs (mps_native_lstm=true)')
     log_info(f"Using device: {device} (MPS Fallback: {os.environ.get('PYTORCH_ENABLE_MPS_FALLBACK', '0')})")
-    eval_device = config.get("eval_device", "cpu" if device == "mps" else device)
+    eval_device = _resolve_aux_device('eval_device', config.get("eval_device", "cpu" if device == "mps" else device), device)
     if eval_device != device:
         log_info(f"Using device: {eval_device} for validation and TensorBoard inference")
     elif device == 'mps':
         log_warning('Validation on MPS can reintroduce variable crop MPSGraph cache growth; prefer eval_device=cpu')
-    aligner_device = config.get("aligner_device", "cpu" if device == "mps" else device)
+    aligner_device = _resolve_aux_device('aligner_device', config.get("aligner_device", "cpu" if device == "mps" else device), device)
     if aligner_device != device:
         log_info(f"Using device: {aligner_device} for text aligner to avoid variable-mel MPSGraph cache growth")
-    discriminator_device = config.get("discriminator_device", device)
-    mpd_device = config.get("mpd_device", discriminator_device)
-    msd_device = config.get("msd_device", discriminator_device)
+    discriminator_device = _resolve_aux_device('discriminator_device', config.get("discriminator_device", device), device)
+    mpd_device = _resolve_aux_device('mpd_device', config.get("mpd_device", discriminator_device), device)
+    msd_device = _resolve_aux_device('msd_device', config.get("msd_device", discriminator_device), device)
     if mpd_device != device:
         log_info(f"Using device: {mpd_device} for MPD discriminator")
     if msd_device != device:
         log_info(f"Using device: {msd_device} for MSD discriminator")
-    wavlm_device = config.get("wavlm_device", "cpu" if device == "mps" else device)
+    wavlm_device = _resolve_aux_device('wavlm_device', config.get("wavlm_device", "cpu" if device == "mps" else device), device)
     if slm_enabled and wavlm_device != device:
         log_info(f"Using device: {wavlm_device} for frozen WavLM perceptual loss")
     adversarial_segment_size = int(config.get("adversarial_segment_size", sr if device == "mps" else 0) or 0)
@@ -458,7 +477,7 @@ def main(config_path, dataset, name, resume):
     fixed_mps_text_length = int(config.get('fixed_mps_text_length', 0) or 0)
     fixed_mps_mel_length = int(config.get('fixed_mps_mel_length', 0) or 0)
     mps_safe_gather_crop = bool(config.get('mps_safe_gather_crop', device == 'mps'))
-    style_ref_crop_frames = int(config.get('style_ref_crop_frames', 240) or 0)
+    style_ref_crop_frames = int(config.get('style_ref_crop_frames', 0) or 0)
     if style_ref_crop_frames > 0:
         log_info(f"Using fixed style reference crop: {style_ref_crop_frames} frames")
     collate_config = {}
@@ -603,6 +622,19 @@ def main(config_path, dataset, name, resume):
         if slm_enabled:
             wl = MyDataParallel(wl)
 
+    def _restore_training_devices():
+        '''Move every module back to its configured training device after eval.'''
+        _ = [model[key].to(device) for key in model]
+        if aligner_device != device:
+            model.text_aligner.to(aligner_device)
+        if mpd_device != device:
+            model.mpd.to(mpd_device)
+        if msd_device != device:
+            model.msd.to(msd_device)
+        if wl is not None:
+            # wl.wd is model.wd, so the loop above moved it to `device`.
+            wl.to(wavlm_device)
+
     sampler = None
     if diffusion_enabled:
         sampler = DiffusionSampler(
@@ -717,6 +749,7 @@ def main(config_path, dataset, name, resume):
     # N steps bounds the leak to fit a full run under the MPS watermark while
     # keeping most of the adversarial signal.
     slmadv_every = max(int(slmadv_params.get('every', 1) or 1), 1)
+    slmadv_calls = 0
     if slmadv_enabled:
         slmadv = SLMAdversarialLoss(
             model,
@@ -780,13 +813,7 @@ def main(config_path, dataset, name, resume):
             writer.add_audio(f"baseline/test_{i + 1:02d}", audio, 0, sample_rate=sr)
             log_info(f"  baseline/test_{i + 1:02d}: {text[:60]}")
     if eval_device != device:
-        _ = [model[key].to(device) for key in model]
-        if aligner_device != device:
-            model.text_aligner.to(aligner_device)
-        if mpd_device != device:
-            model.mpd.to(mpd_device)
-        if msd_device != device:
-            model.msd.to(msd_device)
+        _restore_training_devices()
     _ = [model[key].train() for key in model]
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -797,6 +824,7 @@ def main(config_path, dataset, name, resume):
             gc.collect()
             torch.mps.empty_cache()
         running_loss = 0
+        running_count = 0
         skipped_short_batches = 0
         dropped_short_samples = 0
         skipped_aligner_batches = 0
@@ -959,8 +987,10 @@ def main(config_path, dataset, name, resume):
 
                 sys.exit(1)
 
-            # Use the padding-free fixed-shape reference mel for duration/prosody
-            # conditioning. Do this once before predictor().
+            # As in upstream StyleTTS2, duration is conditioned on the whole
+            # target utterance, and F0/energy (F0Ntrain below) on the reference
+            # clip. Tiling keeps the target input fixed-shape and padding-free.
+            s_dur_target = model.predictor_encoder(_style_ref_crop(mels.detach(), 0).unsqueeze(1))
             s_dur_source = ref_style_mels if multispeaker else _style_ref_crop(mels.detach(), style_ref_crop_frames)
             s_dur = model.predictor_encoder(s_dur_source.unsqueeze(1))
 
@@ -1007,17 +1037,17 @@ def main(config_path, dataset, name, resume):
                 loss_sty = 0
                 loss_diff = 0
 
-            d, p = model.predictor(d_en, s_dur, input_lengths, s2s_attn_mono, text_mask)
+            d, p = model.predictor(d_en, s_dur_target, input_lengths, s2s_attn_mono, text_mask)
             if p is not None and torch.isnan(p).any():
                 log_error(
-                    "NaN detected in p after d, p = model.predictor(d_en, s_dur, input_lengths, s2s_attn_mono, text_mask)"
+                    "NaN detected in p after d, p = model.predictor(d_en, s_dur_target, input_lengths, s2s_attn_mono, text_mask)"
                 )
                 import sys
 
                 sys.exit(1)
             if d is not None and torch.isnan(d).any():
                 log_error(
-                    "NaN detected in d after d, p = model.predictor(d_en, s_dur, input_lengths, s2s_attn_mono, text_mask)"
+                    "NaN detected in d after d, p = model.predictor(d_en, s_dur_target, input_lengths, s2s_attn_mono, text_mask)"
                 )
                 import sys
 
@@ -1169,6 +1199,7 @@ def main(config_path, dataset, name, resume):
             )
 
             running_loss += loss_mel.item()
+            running_count += 1
             g_loss.backward()
             if discriminator_params_frozen:
                 for p_disc in list(model.mpd.parameters()) + list(model.msd.parameters()):
@@ -1204,8 +1235,12 @@ def main(config_path, dataset, name, resume):
                 if y_rec_gt_pred is None:
                     with torch.no_grad():
                         y_rec_gt_pred = model.decoder(en, F0_real, N_real, s).detach()
+                # Count adversarial calls, not loader steps: with every=N the
+                # discriminator's own skip_update schedule would otherwise never
+                # line up with the steps that reach this block.
+                slmadv_calls += 1
                 slm_out = slmadv(
-                    i,
+                    slmadv_calls,
                     y_rec_gt,
                     y_rec_gt_pred,
                     waves,
@@ -1325,7 +1360,8 @@ def main(config_path, dataset, name, resume):
             )
 
             if (i + 1) % log_interval == 0:
-                avg_mel_loss = running_loss / log_interval
+                # Skipped batches add no loss, so divide by the batches counted.
+                avg_mel_loss = running_loss / max(running_count, 1)
                 elapsed = _format_elapsed(time.time() - start_time)
                 memory_line = _torch_memory_report_line(device)
                 step_message = (
@@ -1392,6 +1428,7 @@ def main(config_path, dataset, name, resume):
                 writer.add_scalar("train/speaker_margin_loss", prosody_margin_loss, iters)
 
                 running_loss = 0
+                running_count = 0
 
         if skipped_short_batches or dropped_short_samples or skipped_aligner_batches:
             log_info(
@@ -1457,20 +1494,9 @@ def main(config_path, dataset, name, resume):
 
                         d_gt = s2s_attn_mono.sum(axis=-1).detach()
 
-                    ss = []
-                    gs = []
-
-                    for bib in range(len(mel_input_length)):
-                        mel_length = int(mel_input_length[bib].item())
-                        mel = mels[bib, :, : mel_input_length[bib]]
-                        s = model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1))
-                        ss.append(s)
-                        s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
-                        gs.append(s)
-
-                    s = torch.stack(ss).squeeze(1)
-                    gs = torch.stack(gs).squeeze(1)
-                    s_trg = torch.cat([s, gs], dim=-1).detach()
+                    # Same duration conditioning as training: the whole target
+                    # utterance, tiled to a fixed padding-free width.
+                    s = model.predictor_encoder(_style_ref_crop(mels, 0).unsqueeze(1))
 
                     bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
                     d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
@@ -1634,13 +1660,7 @@ def main(config_path, dataset, name, resume):
                     f"inference/test_{i + 1:02d}", audio, epoch, sample_rate=sr
                 )
         if eval_device != device:
-            _ = [model[key].to(device) for key in model]
-            if aligner_device != device:
-                model.text_aligner.to(aligner_device)
-            if mpd_device != device:
-                model.mpd.to(mpd_device)
-            if msd_device != device:
-                model.msd.to(msd_device)
+            _restore_training_devices()
             stft_loss = stft_loss.to(device)
         _ = [model[key].train() for key in model]
         # ─────────────────────────────────────────────────────────────────────

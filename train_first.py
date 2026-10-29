@@ -302,9 +302,14 @@ def _style_ref_crop(ref_mels, crop_frames, random_start=True):
     inference, where styles come from unpadded mels.  A circular crop inside
     the true length keeps the shape fixed and never shows padding.  True
     lengths are recovered from the content: padded frames are exactly zero.
+
+    crop_frames <= 0 fills the whole input width by tiling the true-length
+    content from its start, so the encoder sees the full utterance and no
+    padding.
     '''
     if not crop_frames or crop_frames <= 0:
-        return ref_mels
+        crop_frames = ref_mels.size(-1)
+        random_start = False
     crop_frames = int(crop_frames)
     lengths = (ref_mels.abs().sum(dim=1) > 0).sum(dim=-1).clamp(min=1)
     if random_start:
@@ -339,7 +344,7 @@ def _s2s_loss(s2s_pred, texts, input_lengths):
 
 
 @click.command()
-@click.option("-p", "--config_path", default="Configs/config.yml", type=str)
+@click.option("-p", "--config_path", default="configs/config_vctk_ft.yml", type=str)
 @click.option('--dataset', type=str, default=None, help='Processed dataset directory from prepare_dataset.py')
 @click.option('-name', '-n', '--name', type=str, default=None, help='Run/output name; saves checkpoints and logs under runs/<name>')
 @click.option(
@@ -419,7 +424,7 @@ def main(config_path, dataset, name, resume):
     fixed_mps_text_length = int(config.get('fixed_mps_text_length', 0) or 0)
     fixed_mps_mel_length = int(config.get('fixed_mps_mel_length', 0) or 0)
     mps_safe_gather_crop = bool(config.get('mps_safe_gather_crop', device == 'mps'))
-    style_ref_crop_frames = int(config.get('style_ref_crop_frames', 240) or 0)
+    style_ref_crop_frames = int(config.get('style_ref_crop_frames', 0) or 0)
     if style_ref_crop_frames > 0:
         log_info(f"Using fixed style reference crop: {style_ref_crop_frames} frames")
     collate_config = {}
@@ -805,7 +810,12 @@ def main(config_path, dataset, name, resume):
             if epoch >= TMA_epoch:  # start TMA training
                 loss_s2s = _s2s_loss(s2s_pred, texts, input_lengths)
 
-                loss_mono = F.l1_loss(s2s_attn, s2s_attn_mono) * 10
+                # Average over valid text/frame cells only; a plain mean over
+                # the padded grid would weaken this loss as padding grows.
+                loss_mono = (
+                    ((s2s_attn - s2s_attn_mono).abs() * mask_ST).sum()
+                    / mask_ST.sum().clamp(min=1)
+                ) * 10
 
                 loss_gen_all = gl(wav_adv.detach(), y_rec_adv).mean()
                 wav_lm, y_rec_lm = _crop_adversarial_audio(wav_g.detach(), y_rec, slm_segment_size)

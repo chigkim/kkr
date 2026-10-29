@@ -938,13 +938,31 @@ def _expand_or_skip_state_dict(module, state_dict):
     return adapted
 
 
+def _match_data_parallel_prefix(module, state_dict):
+    '''Add or drop DataParallel's `module.` prefix to match the target module.
+
+    CUDA runs save wrapped modules, so their keys start with `module.`; loading
+    them into an unwrapped module with strict=False would silently match nothing.
+    '''
+    target_wrapped = any(k.startswith('module.') for k in module.state_dict())
+    source_wrapped = any(k.startswith('module.') for k in state_dict)
+    if source_wrapped and not target_wrapped:
+        return {k[len('module.'):] if k.startswith('module.') else k: v for k, v in state_dict.items()}
+    if target_wrapped and not source_wrapped:
+        return {'module.' + k: v for k, v in state_dict.items()}
+    return state_dict
+
+
 def load_checkpoint(model, optimizer, path, load_only_params=True, ignore_modules=[]):
     state = torch.load(path, map_location="cpu")
     params = state["net"]
     for key in model:
         if key in params and key not in ignore_modules:
             print("%s loaded" % key)
-            model[key].load_state_dict(_expand_or_skip_state_dict(model[key], params[key]), strict=False)
+            module_params = _match_data_parallel_prefix(model[key], params[key])
+            result = model[key].load_state_dict(_expand_or_skip_state_dict(model[key], module_params), strict=False)
+            if result.missing_keys:
+                print("  WARNING: %s is missing %d checkpoint keys (e.g. %s)" % (key, len(result.missing_keys), result.missing_keys[0]))
     _ = [model[key].eval() for key in model]
 
     if not load_only_params:

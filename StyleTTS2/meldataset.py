@@ -82,6 +82,10 @@ class FilePathDataset(torch.utils.data.Dataset):
         idx = 1 if ".wav" in tl[0].split("|")[0] else 0
         self.ptexts = [t.split("|")[idx] for t in tl]
         self.ptexts = [t for t in self.ptexts if len(self.text_cleaner(t)) <= 510]
+        # Keep only texts the sampling loop below can accept; otherwise it never ends.
+        self.ptexts = [t for t in self.ptexts if len(t) >= min_length]
+        if not self.ptexts:
+            raise ValueError(f"{OOD_data} has no texts between {min_length} and 510 tokens")
 
         self.root_path = root_path
 
@@ -116,7 +120,7 @@ class FilePathDataset(torch.utils.data.Dataset):
         ps = ""
 
         while len(ps) < self.min_length:
-            rand_idx = np.random.randint(0, len(self.ptexts) - 1)
+            rand_idx = np.random.randint(0, len(self.ptexts))
             ps = self.ptexts[rand_idx]
 
             text = self.text_cleaner(ps)

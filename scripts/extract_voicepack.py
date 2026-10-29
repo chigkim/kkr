@@ -304,8 +304,9 @@ def extract_voicepack(
     # Must match StyleTTS2's training preprocessing exactly:
     #   mel = to_mel(waveform)   # n_fft=2048, win=1200, hop=300, n_mels=80
     #   mel = (log(1e-5 + mel) - mean) / std   # mean=-4, std=4
+    # sample_rate is deliberately omitted: meldataset.py uses torchaudio's default
+    # (16000) filterbank on 24 kHz audio, and the encoders only work on that input.
     mel_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=24000,
         n_fft=2048,
         win_length=1200,
         hop_length=300,
@@ -334,6 +335,8 @@ def extract_voicepack(
             else:
                 waveform = torch.from_numpy(data).unsqueeze(0)  # [1, samples]
 
+            # Same 5000-sample zero padding as meldataset.py's _load_tensor()
+            waveform = F.pad(waveform, (5000, 5000))
             waveform = waveform.to(device)
 
             # Compute mel spectrogram (same as StyleTTS2's preprocess())

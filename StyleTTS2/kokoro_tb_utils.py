@@ -72,8 +72,9 @@ def extract_voicepack(model, root_path, device, n_samples=200):
         acoustic_norm: float — output norm of style_encoder (health check)
         prosodic_norm: float — output norm of predictor_encoder (health check)
     """
+    # sample_rate is deliberately omitted to match meldataset.py, which uses
+    # torchaudio's default (16000) filterbank on 24 kHz audio.
     mel_transform = torchaudio.transforms.MelSpectrogram(
-        sample_rate=24000,
         n_fft=2048,
         win_length=1200,
         hop_length=300,
@@ -101,6 +102,8 @@ def extract_voicepack(model, root_path, device, n_samples=200):
                 waveform = torch.from_numpy(data).unsqueeze(0)
                 if file_sr != 24000:
                     waveform = torchaudio.functional.resample(waveform, file_sr, 24000)
+                # Same 5000-sample zero padding as meldataset.py's _load_tensor()
+                waveform = torch.nn.functional.pad(waveform, (5000, 5000))
                 waveform = waveform.to(device)
                 mel = mel_transform(waveform)
                 mel = (torch.log(1e-5 + mel) - mel_mean) / mel_std
