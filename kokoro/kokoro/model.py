@@ -65,14 +65,28 @@ class KModel(torch.nn.Module):
         )
         if not model:
             model = hf_hub_download(repo_id=repo_id, filename=KModel.MODEL_NAMES[repo_id])
-        for key, state_dict in torch.load(model, map_location='cpu', weights_only=True).items():
+        weights = torch.load(model, map_location='cpu', weights_only=True)
+        missing_modules = {'bert', 'bert_encoder', 'predictor', 'text_encoder', 'decoder'} - set(weights)
+        if missing_modules:
+            raise ValueError(f'{model} has no weights for {sorted(missing_modules)}')
+        for key, state_dict in weights.items():
             assert hasattr(self, key), key
-            try:
-                getattr(self, key).load_state_dict(state_dict)
-            except:
-                logger.debug(f"Did not load {key} from state_dict")
-                state_dict = {k[7:]: v for k, v in state_dict.items()}
-                getattr(self, key).load_state_dict(state_dict, strict=False)
+            state_dict = {k[7:] if k.startswith('module.') else k: v for k, v in state_dict.items()}
+            module = getattr(self, key)
+            result = module.load_state_dict(state_dict, strict=False)
+            # Neither official nor StyleTTS2 weights store the affine parameters
+            # of AdaIN1d's InstanceNorm, which keep their identity init, or
+            # buffers computed at init (CustomSTFT's window and DFT bases).
+            buffers = {name for name, _ in module.named_buffers()}
+            missing = [
+                k for k in result.missing_keys
+                if k not in buffers and not k.endswith(('.norm.weight', '.norm.bias'))
+            ]
+            if missing or result.unexpected_keys:
+                raise ValueError(
+                    f'{key} weights do not match the model: missing {missing[:5]} ({len(missing)}), '
+                    f'unexpected {result.unexpected_keys[:5]} ({len(result.unexpected_keys)})'
+                )
 
     @property
     def device(self):

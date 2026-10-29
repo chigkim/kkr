@@ -67,12 +67,12 @@ def resolve_checkpoint(run_dir: Path, path: str | None, names: list[str], latest
 
 def main():
     parser = argparse.ArgumentParser(description='Extract voicepacks for selected speakers')
-    parser.add_argument('--run-dir', default='runs/vctk', help='Training run directory with best_1st.pth / best_2nd.pth')
+    parser.add_argument('--run-dir', default='runs/af_punct', help='Training run directory with best_1st.pth / best_2nd.pth')
     parser.add_argument('--stage', choices=['stage1', 'stage2'], default='stage2', help='Use the best Stage 1 or best Stage 2 checkpoint')
     parser.add_argument('--model', default=None, help='Override checkpoint used for predictor_encoder/model')
     parser.add_argument('--style-encoder-model', default=None, help='Override checkpoint used for style_encoder (default: same as --model; pass a Stage 1 checkpoint for the hybrid)')
-    parser.add_argument('--dataset-root', default='../voices/vckt-24k/24k', help='Root containing speaker WAV folders')
-    parser.add_argument('--speakers', default='p239,p261,p303,p307', help='Comma-separated speaker IDs')
+    parser.add_argument('--dataset-root', default='af/en-us', help='Root containing speaker WAV folders')
+    parser.add_argument('--speakers', default='', help='Comma-separated speaker IDs (default: every speaker folder in --dataset-root)')
     parser.add_argument('--output-dir', default=None, help='Output directory for .pt voicepacks (default: voices/<run>_<stage>)')
     parser.add_argument('--num-samples', type=int, default=100, help='Number of WAVs per speaker to average')
     parser.add_argument('--device', default='cpu', choices=['auto', 'cpu', 'cuda'], help='Extraction device')
@@ -97,7 +97,13 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset_root = resolve_path(args.dataset_root)
 
-    for speaker in [s.strip() for s in args.speakers.split(',') if s.strip()]:
+    speakers = [s.strip() for s in args.speakers.split(',') if s.strip()]
+    if not speakers:
+        speakers = sorted(p.name for p in dataset_root.iterdir() if p.is_dir() and any(p.glob('*.wav')))
+    if not speakers:
+        raise FileNotFoundError(f'No speaker folders with WAV files in {dataset_root}')
+
+    for speaker in speakers:
         audio_dir = dataset_root / speaker
         output_path = output_dir / f'{speaker}.pt'
         print(f'\n=== Extracting {speaker} ===')

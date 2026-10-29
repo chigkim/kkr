@@ -17,7 +17,7 @@ fixed_mps_text_length: 512         # pin text/predictor graph width on MPS
 fixed_mps_mel_length: 1152         # pin mel/attention graph width on MPS (covers VCTK max ~1060)
 aligner_bucket_frames: 64          # text aligner sees mels cut to the batch's longest clip, rounded up to this; its GroupNorm otherwise normalises over the 1152-frame padding and shifts alignments (at most 18 widths on MPS)
 mps_safe_gather_crop: true         # crop decoder windows via tensor gather instead of per-start strided slices
-style_ref_crop_frames: 0           # 0 = style/prosody encoders see the full reference mel; collation padding is masked inside the encoders (StyleEncoder lengths). The 240-frame random crop (2f683fa) is the prime suspect for weak speaker conditioning: a per-step-changing style input teaches the model to discount it.
+style_ref_crop_frames: 0           # 0 = no extra crop in _style_ref_input; references are still randomly cropped to 192 frames (2.4 s) by meldataset.py (max_mel_length), while extraction encodes whole utterances. Collation padding is masked inside the encoders (StyleEncoder lengths). Whether the earlier 240-frame crop (2f683fa) weakened speaker conditioning was never measured with the fixed extraction filterbank.
 mps_cpu_threads: 1                 # torch CPU threads on MPS; 1, 4 and 8 timed equal on M3 Max (2.80, 2.88, 2.83 s/step at batch 8)
 mps_native_lstm: false             # CPU-LSTM workaround is ~5-8% faster in Stage 2; true = keep packed LSTMs on MPS
 aligner_device: "mps"             # experiment: run text aligner on MPS

@@ -7,26 +7,30 @@ both style encoders (acoustic + prosodic) on representative utterances and
 averaging the resulting style vectors.
 
 Usage:
-    # Single checkpoint (Stage 1 only — uses style_encoder for both halves)
+    # Stage 2 checkpoint (both halves from the same checkpoint, whose decoder
+    # was trained together with its style_encoder)
     python scripts/extract_voicepack.py \
-        --model StyleTTS2/logs/kokoro_german/epoch_1st_00002.pth \
-        --audio-dir dataset/audio/dm_daniel \
-        --output voices/dm_daniel.pt
+        --model runs/af_punct/best_2nd.pth \
+        --audio-dir af/en-us/p294 \
+        --output voices/af_punct_stage2/p294.pt
 
-    # Two checkpoints (recommended after Stage 2 training):
-    #   style_encoder from Stage 1, predictor_encoder from Stage 2
+    # Stage 1 checkpoint (predictor_encoder is untrained, so style_encoder is
+    # used for both halves, as Stage 2 initializes it)
     python scripts/extract_voicepack.py \
-        --model StyleTTS2/logs/kokoro_german/epoch_2nd_00001.pth \
-        --style-encoder-model StyleTTS2/logs/kokoro_german/epoch_1st_00002.pth \
-        --audio-dir dataset/audio/dm_daniel \
-        --output voices/dm_daniel.pt
-
-    # CPU (slower but works without GPU / while GPU is busy training)
-    python scripts/extract_voicepack.py \
-        --model StyleTTS2/logs/kokoro_german/epoch_1st_00002.pth \
-        --audio-dir dataset/audio/dm_daniel \
-        --output voices/dm_daniel.pt \
+        --model runs/af_punct/best_1st.pth \
+        --audio-dir af/en-us/p294 \
+        --output voices/af_punct_stage1/p294.pt \
         --device cpu
+
+    # Hybrid for comparison: style_encoder from Stage 1, the rest from Stage 2
+    python scripts/extract_voicepack.py \
+        --model runs/af_punct/best_2nd.pth \
+        --style-encoder-model runs/af_punct/best_1st.pth \
+        --audio-dir af/en-us/p294 \
+        --output voices/af_punct_hybrid/p294.pt
+
+The files used are listed next to the voicepack in <name>.files.json, so
+evaluation can keep them out of its real-recording enrollment set.
 
 Voicepack format: tensor of shape [510, 1, 256] (float32)
   - 510 = max phoneme sequence length
@@ -36,6 +40,7 @@ Voicepack format: tensor of shape [510, 1, 256] (float32)
 """
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -184,6 +189,18 @@ class StyleEncoder(nn.Module):
 # ── Main extraction logic ───────────────────────────────────────────────
 
 
+def _predictor_encoder_trained(checkpoint):
+    """Whether the checkpoint's predictor_encoder was ever optimized.
+
+    Stage 1 never steps predictor_encoder, so its Adam state stays empty
+    until Stage 2. Returns None when the checkpoint has no optimizer state.
+    """
+    optimizer_state = dict(checkpoint.get("optimizer") or [])
+    if "predictor_encoder" not in optimizer_state:
+        return None
+    return len(optimizer_state["predictor_encoder"].get("state", {})) > 0
+
+
 def extract_voicepack(
     model_path: str,
     audio_dir: str,
@@ -238,9 +255,9 @@ def extract_voicepack(
     predictor_encoder = StyleEncoder(dim_in=64, style_dim=128, max_conv_dim=512)
 
     # Load style_encoder weights — from a separate checkpoint if provided,
-    # otherwise from the main checkpoint. Stage 2 training can degrade the
-    # style_encoder (spectral_norm buffer drift), so loading from Stage 1
-    # is recommended when using a Stage 2 checkpoint.
+    # otherwise from the main checkpoint. The default pairs the style_encoder
+    # with the decoder it was trained with; the Stage 1 encoder with a Stage 2
+    # decoder is an untested alternative, not a known improvement.
     if style_encoder_model:
         print(f"Loading style_encoder from separate checkpoint: {style_encoder_model}")
         se_checkpoint = torch.load(
@@ -253,22 +270,19 @@ def extract_voicepack(
     else:
         style_encoder.load_state_dict(strip_prefix(net["style_encoder"]))
 
-    # predictor_encoder is only trained in Stage 2 (train_second.py).
-    # After Stage 1 only, its weights are randomly initialized and produce
-    # exploded outputs even though parameter norms look reasonable.
-    # Detect this by checking output norm on a dummy input. If exploded,
-    # fall back to using style_encoder for both halves of the voicepack
-    # (same initialization Stage 2 uses — it deep-copies style_encoder).
-    predictor_encoder_trained = True
-    try:
+    # predictor_encoder is only trained in Stage 2 (train_second.py); a
+    # Stage 1 checkpoint holds its random initialization, whose outputs are
+    # small and constant-looking rather than exploded, so output norms cannot
+    # identify it. In that case use style_encoder for both halves of the
+    # voicepack (the initialization Stage 2 uses — it deep-copies
+    # style_encoder).
+    predictor_encoder_trained = _predictor_encoder_trained(checkpoint)
+    if predictor_encoder_trained is None:
+        print("  WARNING: checkpoint has no optimizer state; assuming predictor_encoder is trained")
+        predictor_encoder_trained = True
+    if "predictor_encoder" in net:
         predictor_encoder.load_state_dict(strip_prefix(net["predictor_encoder"]))
-        # Test output norm on a dummy mel-like input
-        with torch.no_grad():
-            dummy = torch.randn(1, 1, 80, 200)
-            test_out = predictor_encoder(dummy)
-            if test_out.norm().item() > 1e3:
-                predictor_encoder_trained = False
-    except Exception:
+    else:
         predictor_encoder_trained = False
 
     if not predictor_encoder_trained:
@@ -319,6 +333,7 @@ def extract_voicepack(
     # ── Extract style vectors ────────────────────────────────────────────
     acoustic_styles = []
     prosodic_styles = []
+    used_files = []
     skipped = 0
 
     print(f"\nExtracting style vectors...")
@@ -354,8 +369,12 @@ def extract_voicepack(
             s_acoustic = style_encoder(mel_input)  # [1, 128]
             s_prosodic = predictor_encoder(mel_input)  # [1, 128]
 
+            if not (torch.isfinite(s_acoustic).all() and torch.isfinite(s_prosodic).all()):
+                raise ValueError(f"Non-finite style vector for {wav_path}; the checkpoint is broken")
+
             acoustic_styles.append(s_acoustic.cpu())
             prosodic_styles.append(s_prosodic.cpu())
+            used_files.append(str(wav_path.resolve()))
 
             if (i + 1) % 50 == 0:
                 print(f"  Processed {i + 1}/{len(wav_files)} files...")
@@ -370,11 +389,12 @@ def extract_voicepack(
         sys.exit(1)
 
     # ── Combine per-utterance styles and build voicepack ─────────────────
-    # Plain averaging cancels utterance-specific components and shrinks the
-    # vector toward the global mean, which measurably dilutes speaker
-    # identity at inference (timbre separation drops ~40% vs single-utterance
-    # styles). 'medoid' keeps a real, in-distribution style: the utterance
-    # closest to the speaker mean.
+    # Training conditions on single-utterance styles, so 'medoid' keeps a
+    # real, in-distribution style: the utterance closest to the speaker mean.
+    # Plain averaging gives a vector with a smaller norm than any single
+    # utterance. Which mode reproduces speakers best has not been measured
+    # with the current (training-matched) mel filterbank. Each half is
+    # combined separately, so medoid may pick different utterances for them.
     def combine(styles):
         M = torch.cat(styles, dim=0)  # [N, 128]
         mean = M.mean(dim=0)
@@ -405,6 +425,9 @@ def extract_voicepack(
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(voicepack, str(output))
     print(f"\nSaved voicepack: {output} ({output.stat().st_size / 1024:.1f} KB)")
+    files_path = output.with_suffix(".files.json")
+    files_path.write_text(json.dumps(used_files, indent=1) + "\n", encoding="utf-8")
+    print(f"Saved file list: {files_path}")
 
 
 def main():
@@ -413,22 +436,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Stage 1 only (uses style_encoder for both halves)
+  # After Stage 2 (both halves from the same checkpoint)
   python scripts/extract_voicepack.py \\
-      --model StyleTTS2/logs/kokoro_german/epoch_1st_00002.pth \\
-      --audio-dir dataset/audio/dm_daniel \\
-      --output voices/dm_daniel.pt
+      --model runs/af_punct/best_2nd.pth \\
+      --audio-dir af/en-us/p294 \\
+      --output voices/af_punct_stage2/p294.pt
 
-  # After Stage 2 (recommended: style_encoder from Stage 1, predictor_encoder from Stage 2)
+  # Stage 1 only (uses style_encoder for both halves), on CPU
   python scripts/extract_voicepack.py \\
-      --model StyleTTS2/logs/kokoro_german/epoch_2nd_00001.pth \\
-      --style-encoder-model StyleTTS2/logs/kokoro_german/epoch_1st_00002.pth \\
-      --audio-dir dataset/audio/dm_daniel \\
-      --output voices/dm_daniel.pt
-
-  # CPU (while GPU is busy training)
-  python scripts/extract_voicepack.py \\
-      --model StyleTTS2/logs/kokoro_german/epoch_1st_00002.pth \\
+      --model runs/af_punct/best_1st.pth \\
+      --audio-dir af/en-us/p294 \\
+      --output voices/af_punct_stage1/p294.pt \\
       --device cpu
 """,
     )
@@ -441,9 +459,9 @@ Examples:
     parser.add_argument(
         "--style-encoder-model",
         default=None,
-        help="Path to a separate checkpoint for loading the style_encoder weights. "
-        "Recommended: use a Stage 1 checkpoint here when --model is a Stage 2 "
-        "checkpoint, because Stage 2 can degrade the style_encoder.",
+        help="Path to a separate checkpoint for loading the style_encoder weights "
+        "(default: --model). A Stage 1 checkpoint here with a Stage 2 --model gives "
+        "the hybrid, which is an untested alternative to the default pairing.",
     )
     parser.add_argument(
         "--audio-dir",
@@ -472,8 +490,8 @@ Examples:
         default="medoid",
         choices=["medoid", "mean", "mean-renorm"],
         help="How to combine per-utterance styles: medoid = real utterance style "
-        "closest to the speaker mean (default; plain mean dilutes speaker identity), "
-        "mean = average, mean-renorm = average rescaled to typical utterance norm",
+        "closest to the speaker mean (default), mean = average, "
+        "mean-renorm = average rescaled to typical utterance norm",
     )
 
     args = parser.parse_args()

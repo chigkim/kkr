@@ -97,7 +97,7 @@ def convert_checkpoint(checkpoint_path: str, output_path: str) -> str:
             kokoro_weights[key] = ensure_module_prefix(net[key])
             print(f"  {key}: {len(kokoro_weights[key])} keys")
         else:
-            print(f"  WARNING: '{key}' not found in checkpoint")
+            raise KeyError(f"'{key}' not found in checkpoint {checkpoint_path}")
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)

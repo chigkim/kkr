@@ -52,8 +52,10 @@ def main():
         model_path = REPO_ROOT / args.model
     else:
         model_path = out / (Path(args.checkpoint).stem + '_kokoro.pth')
-        if not model_path.exists():
-            convert_checkpoint(str(REPO_ROOT / args.checkpoint), str(model_path))
+        checkpoint_path = REPO_ROOT / args.checkpoint
+        # Reconvert when the checkpoint is newer, e.g. a replaced best_2nd.pth.
+        if not model_path.exists() or model_path.stat().st_mtime < checkpoint_path.stat().st_mtime:
+            convert_checkpoint(str(checkpoint_path), str(model_path))
 
     device = resolve_device(args.device)
     print(f'Using {device} device')

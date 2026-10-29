@@ -120,14 +120,22 @@ def extract_voicepack(model, root_path, device, n_samples=200, speaker=None):
         logger.warning("extract_voicepack: no valid audio files processed")
         return None, 0.0, 0.0
 
-    avg_acoustic = torch.cat(acoustic_styles, dim=0).mean(dim=0)  # [128]
-    avg_prosodic = torch.cat(prosodic_styles, dim=0).mean(dim=0)  # [128]
+    # Medoid, as in the default --style-mode of scripts/extract_voicepack.py,
+    # so previews use the same kind of voicepack that evaluation does.
+    avg_acoustic = _medoid(acoustic_styles)  # [128]
+    avg_prosodic = _medoid(prosodic_styles)  # [128]
     voicepack = torch.cat([avg_acoustic, avg_prosodic], dim=0)  # [256]
 
     acoustic_norm = avg_acoustic.norm().item()
     prosodic_norm = avg_prosodic.norm().item()
 
     return voicepack.to(device), acoustic_norm, prosodic_norm
+
+
+def _medoid(styles):
+    """The per-utterance style closest to the mean of `styles` ([1, D] each)."""
+    M = torch.cat(styles, dim=0)
+    return M[(M - M.mean(dim=0)).norm(dim=1).argmin()]
 
 
 def run_kokoro_inference(model, test_tokens, voicepack, device, text_cleaner):

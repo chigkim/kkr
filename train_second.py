@@ -273,11 +273,16 @@ def _resolve_aux_device(name, configured, device):
 # extractor's BatchNorm would otherwise use batch statistics for F0_real, and
 # aligner/text-encoder dropout would perturb the alignment and decoder input.
 FROZEN_MODULES = ('text_aligner', 'pitch_extractor', 'text_encoder')
+# The decoder still trains after joint_epoch, but stays in eval mode as in
+# upstream Stage 2: in train mode ISTFTNet randomly smooths the F0 and energy
+# curves (Modules/istftnet.py Decoder.forward), which would change the audio
+# loss that trains the prosody predictor.
+EVAL_MODE_MODULES = FROZEN_MODULES + ('decoder',)
 
 
 def _set_train_mode(model):
     for key in model:
-        if key in FROZEN_MODULES:
+        if key in EVAL_MODE_MODULES:
             model[key].eval()
         else:
             model[key].train()
@@ -408,7 +413,10 @@ def main(config_path, dataset, name, resume):
     log_dir = config["log_dir"]
     if not osp.exists(log_dir):
         os.makedirs(log_dir, exist_ok=True)
-    shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
+    # Stage-specific name so Stage 1's copy of the config in the same run
+    # directory is kept.
+    config_stem, config_ext = osp.splitext(osp.basename(config_path))
+    shutil.copy(config_path, osp.join(log_dir, f"{config_stem}_2nd{config_ext}"))
     writer = SummaryWriter(log_dir + "/tensorboard")
 
     # write logs
@@ -1004,9 +1012,11 @@ def main(config_path, dataset, name, resume):
                 sys.exit(1)
 
             # As in upstream StyleTTS2, duration is conditioned on the whole
-            # target utterance, and F0/energy (F0Ntrain below) on the reference
-            # clip. Length masking keeps the target input fixed-shape and
-            # excludes the collation padding.
+            # target utterance. Unlike upstream, which uses a crop of that same
+            # target, F0/energy (F0Ntrain below) and the decoder are conditioned
+            # on ref_mels, a different recording of the same speaker in
+            # multispeaker runs. Length masking keeps the target input
+            # fixed-shape and excludes the collation padding.
             s_dur_target = model.predictor_encoder(mels.detach().unsqueeze(1), mel_input_length)
             if multispeaker:
                 s_dur = model.predictor_encoder(ref_style_mels.unsqueeze(1), ref_style_lengths)

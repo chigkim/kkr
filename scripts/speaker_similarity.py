@@ -85,12 +85,21 @@ def main():
         raise SystemExit(f'Need at least two voicepacks in {voice_dir}')
 
     audio_root = Path(args.audio_root)
-    real, centroid = {}, {}
+    real, centroid, real_files = {}, {}, {}
     for s in speakers:
         files = sorted(glob.glob(str(audio_root / s / '*.wav')))
+        # Keep the recordings the voicepack was extracted from out of the
+        # real-recording centroid and held-out set.
+        used_path = voice_dir / f'{s}.files.json'
+        if used_path.exists():
+            used = {str(Path(f).resolve()) for f in json.loads(used_path.read_text(encoding='utf-8'))}
+            files = [f for f in files if str(Path(f).resolve()) not in used]
+        else:
+            print(f'WARNING: no {used_path.name}; real recordings may overlap the extraction set')
         if len(files) < 4:
             raise SystemExit(f'Need at least 4 real WAVs for {s} in {audio_root / s}')
-        e = [embed(*sf.read(f)) for f in random.sample(files, min(args.real_per_speaker, len(files)))]
+        real_files[s] = random.sample(files, min(args.real_per_speaker, len(files)))
+        e = [embed(*sf.read(f)) for f in real_files[s]]
         real[s] = e[:3]
         centroid[s] = F.normalize(torch.stack(e[3:]).mean(0), dim=0)
 
@@ -104,6 +113,9 @@ def main():
         voice = torch.load(voice_dir / f'{s}.pt', weights_only=True)
         embs = []
         for k, text in enumerate(TEXTS):
+            # Kokoro's source excitation draws torch noise; seed it so runs
+            # repeat and every speaker gets the same noise for a given text.
+            torch.manual_seed(args.seed + k)
             audio = np.concatenate([r.audio.numpy() for r in pipe(text, voice=voice)])
             if k == 0:
                 sf.write(out / f'{s}.wav', audio, 24000)
@@ -128,6 +140,7 @@ def main():
         'between_generated': between(generated),
         'between_real': between(real),
         'ranks': ranks,
+        'real_files': real_files,
     }
     print(f'\nSpeaker ID vs real centroids: top-1 {correct}/{n} (real recordings: {real_correct}/{n}), median rank {results["median_rank"]:g}/{n}')
     print(f'Between-speaker cosine: generated {results["between_generated"]:.3f}, real {results["between_real"]:.3f} (lower = more distinct)')

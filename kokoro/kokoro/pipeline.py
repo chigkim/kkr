@@ -239,6 +239,26 @@ class KPipeline:
     def tokens_to_text(tokens: List[en.MToken]) -> str:
         return ''.join(t.text + t.whitespace for t in tokens).strip()
 
+    @staticmethod
+    def _split_long_chunk(chunk: str, chunk_size: int) -> List[str]:
+        '''Split text longer than chunk_size, preferring the last comma, semicolon
+        or colon in the second half of the window, then the last space.'''
+        pieces = []
+        while len(chunk) > chunk_size:
+            head = chunk[:chunk_size + 1]
+            cut = max(head.rfind(p) for p in ',;:')
+            if cut < chunk_size // 2:
+                cut = head.rfind(' ')
+            if cut <= 0:
+                cut = chunk_size
+            else:
+                cut += 1
+            pieces.append(chunk[:cut].strip())
+            chunk = chunk[cut:].strip()
+        if chunk:
+            pieces.append(chunk)
+        return pieces
+
     def en_tokenize(
         self,
         tokens: List[en.MToken]
@@ -462,6 +482,10 @@ class KPipeline:
                 # If no chunks were created (no sentence boundaries), fall back to character-based chunking
                 if not chunks:
                     chunks = [graphemes[i:i+chunk_size] for i in range(0, len(graphemes), chunk_size)]
+
+                # A single sentence longer than chunk_size would otherwise be cut
+                # at 510 phonemes below; split it at word boundaries instead.
+                chunks = [piece for chunk in chunks for piece in KPipeline._split_long_chunk(chunk, chunk_size)]
                 
                 # Process each chunk
                 for chunk in chunks:

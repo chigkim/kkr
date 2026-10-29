@@ -250,7 +250,9 @@ def cmd_precompute():
 
     print(f"Pre-computing features for {len(wav_files):,} files...")
 
-    # Set up mel spectrogram transform
+    # Set up mel spectrogram transform. Training does not read these features:
+    # meldataset.py computes mels itself with torchaudio's default (16 kHz)
+    # filterbank, so these 24 kHz mels must not be fed to the style encoders.
     mel_transform = torchaudio.transforms.MelSpectrogram(
         sample_rate=SAMPLE_RATE,
         n_fft=N_FFT,
