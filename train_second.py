@@ -453,8 +453,8 @@ def main(config_path, dataset, name, resume):
     if device == "mps":
         os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
         prev_threads = torch.get_num_threads()
-        torch.set_num_threads(1)
-        log_info(f"Set torch CPU threads: {prev_threads} -> {torch.get_num_threads()} for MPS native-heap pressure")
+        torch.set_num_threads(int(config.get('mps_cpu_threads', 1)))
+        log_info(f"Set torch CPU threads: {prev_threads} -> {torch.get_num_threads()} (mps_cpu_threads)")
         if bool(config.get('mps_native_lstm', False)):
             set_mps_native_lstm(True)
             log_info('Using native MPS packed LSTMs (mps_native_lstm=true)')
