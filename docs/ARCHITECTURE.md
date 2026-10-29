@@ -48,9 +48,9 @@ Requirement:
 
 ## German G2P Notes
 
-- G2P backend: `misaki` + `espeak-ng`
-- Code path uses `espeak.EspeakG2P(language='en-us')`
-- Symbol `ʏ` is not in Kokoro vocab and must be normalized to `y`
+- G2P backend: `phonemizer` with the `espeak` backend, for every language, at both data prep (`prepare_dataset.py`) and inference (`KPipeline(lang_code='de', g2p_backend='phonemizer')`)
+- The language code is the espeak code taken from the dataset folder name (e.g. `de`, `en-us`)
+- Symbol `ʏ` is not in the base Kokoro vocab; `prepare_dataset.py` adds it to `symbols.json` as a new token
 
 ## German Phoneme Compatibility
 
@@ -76,9 +76,9 @@ All standard German phonemes are covered by Kokoro's 178-token set:
 
 | IPA | Unicode | Meaning | Fix |
 |-----|---------|---------|-----|
-| `ʏ` | U+028F | short ü | Map to `y` (U+0079) |
+| `ʏ` | U+028F | short ü | Added as a new token in `symbols.json` |
 
-`ʏ` is produced by `espeak-ng` for short ü (e.g., in "Bücher"). It is not in Kokoro's vocabulary. Replace it with `y` (long ü) in post-processing. The model learns the duration difference from the audio context.
+`ʏ` is produced by `espeak-ng` for short ü (e.g., in "München"). It is not in the base Kokoro vocabulary, so `prepare_dataset.py` appends it to `symbols.json` and training expands the embeddings. Inference keeps `ʏ` when the model's `config.json` vocab has it. For base Kokoro models, whose vocab lacks it, `KPipeline` maps it to `y` (long ü).
 
 ### Diacritics (stress markers)
 

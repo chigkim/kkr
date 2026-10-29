@@ -51,7 +51,8 @@ def main():
     parser.add_argument('--voices', required=True, help='Directory of <speaker>.pt voicepacks')
     parser.add_argument('--audio-root', default='af/en-us', help='Directory with one folder of real WAVs per speaker')
     parser.add_argument('--config', default='dataset/config.json', help='KModel config.json matching the checkpoint vocab')
-    parser.add_argument('--lang', default='a', help='KPipeline language code for the test sentences')
+    parser.add_argument('--lang', default='en-us', help='KPipeline language code for the test sentences (espeak code with --g2p-backend phonemizer)')
+    parser.add_argument('--g2p-backend', default='phonemizer', choices=['phonemizer', 'kokoro'], help='Inference G2P; phonemizer matches lists from prepare_dataset.py')
     parser.add_argument('--out', required=True, help='Output directory for samples, converted model and results.json')
     parser.add_argument('--real-per-speaker', type=int, default=11, help='Real WAVs per speaker: 3 held out, the rest form the centroid')
     parser.add_argument('--seed', type=int, default=0)
@@ -96,7 +97,7 @@ def main():
     kpath = out / 'kmodel.pth'
     convert_checkpoint(str(args.checkpoint), str(kpath))
     model = KModel(repo_id='hexgrad/Kokoro-82M', config=str(args.config), model=str(kpath)).eval()
-    pipe = KPipeline(lang_code=args.lang, repo_id='hexgrad/Kokoro-82M', model=model)
+    pipe = KPipeline(lang_code=args.lang, repo_id='hexgrad/Kokoro-82M', model=model, g2p_backend=args.g2p_backend)
 
     generated = {}
     for s in speakers:

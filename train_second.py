@@ -268,25 +268,39 @@ def _resolve_aux_device(name, configured, device):
     return configured
 
 
-def _style_ref_crop(ref_mels, crop_frames, random_start=True):
-    '''Fixed-width circular time crop for style/prosody encoder inputs.
+# Pretrained helpers that Stage 2 runs under no_grad and never steps. Keeping
+# them in eval mode during training gives deterministic targets: the pitch
+# extractor's BatchNorm would otherwise use batch statistics for F0_real, and
+# aligner/text-encoder dropout would perturb the alignment and decoder input.
+FROZEN_MODULES = ('text_aligner', 'pitch_extractor', 'text_encoder')
 
-    The collater zero-pads mels to the fixed MPS width, but the style encoders
-    average over time without masking, so padding (which is not silence in
-    normalized log-mel space) dilutes the style vector and mismatches
-    inference, where styles come from unpadded mels.  A circular crop inside
-    the true length keeps the shape fixed and never shows padding.  True
-    lengths are recovered from the content: padded frames are exactly zero.
 
-    crop_frames <= 0 fills the whole input width by tiling the true-length
-    content from its start, so the encoder sees the full utterance and no
-    padding.
+def _set_train_mode(model):
+    for key in model:
+        if key in FROZEN_MODULES:
+            model[key].eval()
+        else:
+            model[key].train()
+
+
+def _style_ref_input(ref_mels, crop_frames, random_start=True):
+    '''Padding-free style/prosody encoder input: returns (mels, lengths).
+
+    The collater zero-pads mels to the fixed MPS width. Padding is not
+    silence in normalized log-mel space, and the style encoders average over
+    time, so unmasked padding dilutes the style vector and mismatches
+    inference, where styles come from unpadded mels. True lengths are
+    recovered from the content: padded frames are exactly zero.
+
+    crop_frames <= 0 keeps the whole clip and returns its lengths, which the
+    encoders use to mask padding (StyleEncoder(x, lengths)). crop_frames > 0
+    takes a fixed-width circular crop inside the true length; it holds no
+    padding, so lengths is None.
     '''
-    if not crop_frames or crop_frames <= 0:
-        crop_frames = ref_mels.size(-1)
-        random_start = False
-    crop_frames = int(crop_frames)
     lengths = (ref_mels.abs().sum(dim=1) > 0).sum(dim=-1).clamp(min=1)
+    if not crop_frames or crop_frames <= 0:
+        return ref_mels, lengths
+    crop_frames = int(crop_frames)
     if random_start:
         starts = (torch.rand(ref_mels.size(0), device=ref_mels.device) * lengths).long()
     else:
@@ -294,7 +308,7 @@ def _style_ref_crop(ref_mels, crop_frames, random_start=True):
     base = torch.arange(crop_frames, device=ref_mels.device).unsqueeze(0)
     idx = (starts.unsqueeze(1) + base) % lengths.unsqueeze(1)
     idx = idx.unsqueeze(1).expand(ref_mels.size(0), ref_mels.size(1), crop_frames)
-    return torch.gather(ref_mels, dim=-1, index=idx)
+    return torch.gather(ref_mels, dim=-1, index=idx), None
 
 
 def _gb(value):
@@ -701,7 +715,7 @@ def main(config_path, dataset, name, resume):
             log_info(f"Resuming second-stage training from epoch {start_epoch}/{epochs - 1}")
         # Ensure all modules are in train() mode after loading
         # (load_checkpoint sets them to eval(), which breaks spectral_norm)
-        _ = [model[key].train() for key in model]
+        _set_train_mode(model)
 
     # DP — must happen AFTER load_checkpoint so state dict keys match
     # (DataParallel adds 'module.' prefix which breaks strict=False loading)
@@ -777,7 +791,7 @@ def main(config_path, dataset, name, resume):
 
     # ── Kokoro-faithful TensorBoard inference setup ───────────────────────────
     text_cleaner = TextCleaner()
-    _test_tokens = prepare_test_tokens(text_cleaner)
+    _test_tokens = prepare_test_tokens(text_cleaner, OOD_data)
     if _test_tokens:
         log_info(
             f"TensorBoard inference: prepared {len(_test_tokens)} test sentences"
@@ -814,7 +828,7 @@ def main(config_path, dataset, name, resume):
             log_info(f"  baseline/test_{i + 1:02d}: {text[:60]}")
     if eval_device != device:
         _restore_training_devices()
-    _ = [model[key].train() for key in model]
+    _set_train_mode(model)
     # ─────────────────────────────────────────────────────────────────────────
 
     epoch_durations = []
@@ -832,7 +846,7 @@ def main(config_path, dataset, name, resume):
 
         _ = [model[key].eval() for key in model]
 
-        _ = [model[key].train() for key in model]
+        _set_train_mode(model)
 
         if epoch >= joint_epoch:
             start_ds = True
@@ -940,20 +954,20 @@ def main(config_path, dataset, name, resume):
 
                 d_gt = s2s_attn_mono.sum(axis=-1).detach()
 
-                # Padding-free, fixed-shape style-encoder input (see _style_ref_crop).
-                ref_style_mels = _style_ref_crop(ref_mels, style_ref_crop_frames)
+                # Padding-free, fixed-shape style-encoder input (see _style_ref_input).
+                ref_style_mels, ref_style_lengths = _style_ref_input(ref_mels, style_ref_crop_frames)
 
                 ref = None
 
                 # compute reference styles
                 if multispeaker and epoch >= diff_epoch:
-                    ref_ss = model.style_encoder(ref_style_mels.unsqueeze(1))
+                    ref_ss = model.style_encoder(ref_style_mels.unsqueeze(1), ref_style_lengths)
                     if ref_ss is not None and torch.isnan(ref_ss).any():
                         log_error("NaN detected in ref_ss after ref_ss = model.style_encoder(")
                         import sys
 
                         sys.exit(1)
-                    ref_sp = model.predictor_encoder(ref_style_mels.unsqueeze(1))
+                    ref_sp = model.predictor_encoder(ref_style_mels.unsqueeze(1), ref_style_lengths)
                     ref = torch.cat([ref_ss, ref_sp], dim=1)
 
             # Target styles for the denoiser/SLM adversarial path. Outputs are
@@ -963,9 +977,9 @@ def main(config_path, dataset, name, resume):
             need_s_trg = diffusion_enabled or slmadv_enabled
             if need_s_trg:
                 with torch.no_grad():
-                    gt_style_mels = _style_ref_crop(mels, style_ref_crop_frames)
-                    s_trg_dur = model.predictor_encoder(gt_style_mels.unsqueeze(1))  # global prosodic styles
-                    s_trg_acoustic = model.style_encoder(gt_style_mels.unsqueeze(1))  # global acoustic styles
+                    gt_style_mels, gt_style_lengths = _style_ref_input(mels, style_ref_crop_frames)
+                    s_trg_dur = model.predictor_encoder(gt_style_mels.unsqueeze(1), gt_style_lengths)  # global prosodic styles
+                    s_trg_acoustic = model.style_encoder(gt_style_mels.unsqueeze(1), gt_style_lengths)  # global acoustic styles
                     s_trg = torch.cat([s_trg_acoustic, s_trg_dur], dim=-1).detach()  # ground truth for denoiser
             else:
                 s_trg = None
@@ -989,10 +1003,14 @@ def main(config_path, dataset, name, resume):
 
             # As in upstream StyleTTS2, duration is conditioned on the whole
             # target utterance, and F0/energy (F0Ntrain below) on the reference
-            # clip. Tiling keeps the target input fixed-shape and padding-free.
-            s_dur_target = model.predictor_encoder(_style_ref_crop(mels.detach(), 0).unsqueeze(1))
-            s_dur_source = ref_style_mels if multispeaker else _style_ref_crop(mels.detach(), style_ref_crop_frames)
-            s_dur = model.predictor_encoder(s_dur_source.unsqueeze(1))
+            # clip. Length masking keeps the target input fixed-shape and
+            # excludes the collation padding.
+            s_dur_target = model.predictor_encoder(mels.detach().unsqueeze(1), mel_input_length)
+            if multispeaker:
+                s_dur = model.predictor_encoder(ref_style_mels.unsqueeze(1), ref_style_lengths)
+            else:
+                own_style_mels, own_style_lengths = _style_ref_input(mels.detach(), style_ref_crop_frames)
+                s_dur = model.predictor_encoder(own_style_mels.unsqueeze(1), own_style_lengths)
 
             # denoiser training
             if diffusion_enabled and epoch >= diff_epoch:
@@ -1113,8 +1131,10 @@ def main(config_path, dataset, name, resume):
                 lambda_margin=loss_params.get('lambda_speaker_margin', 0),
                 margin=loss_params.get('speaker_center_margin', 1.0),
             )
-            s = model.style_encoder(
-                st.unsqueeze(1) if multispeaker else gt.unsqueeze(1)
+            s = (
+                model.style_encoder(st.unsqueeze(1), ref_style_lengths)
+                if multispeaker
+                else model.style_encoder(gt.unsqueeze(1))
             )
 
             y_rec_gt = wav.unsqueeze(1)
@@ -1252,72 +1272,74 @@ def main(config_path, dataset, name, resume):
                     ref,
                 )
 
+                # None: too few clips long enough for the SLM crop. Skip only
+                # the SLM update; the main step already ran, so still count it.
                 if slm_out is None:
-                    continue
+                    d_loss_slm, loss_gen_lm = 0, 0
+                else:
+                    d_loss_slm, loss_gen_lm, y_pred = slm_out
 
-                d_loss_slm, loss_gen_lm, y_pred = slm_out
+                    # SLM generator loss
+                    optimizer.zero_grad()
+                    loss_gen_lm.backward()
 
-                # SLM generator loss
-                optimizer.zero_grad()
-                loss_gen_lm.backward()
-
-                # compute the gradient norm
-                total_norm = {}
-                for key in model.keys():
-                    total_norm[key] = 0
-                    parameters = [
-                        p
-                        for p in model[key].parameters()
-                        if p.grad is not None and p.requires_grad
-                    ]
-                    for p in parameters:
-                        param_norm = p.grad.detach().data.norm(2)
-                        total_norm[key] += param_norm.item() ** 2
-                    total_norm[key] = total_norm[key] ** 0.5
-
-                # gradient scaling
-                if total_norm["predictor"] > slmadv_params.thresh:
+                    # compute the gradient norm
+                    total_norm = {}
                     for key in model.keys():
-                        for p in model[key].parameters():
-                            if p.grad is not None:
-                                p.grad *= 1 / total_norm["predictor"]
+                        total_norm[key] = 0
+                        parameters = [
+                            p
+                            for p in model[key].parameters()
+                            if p.grad is not None and p.requires_grad
+                        ]
+                        for p in parameters:
+                            param_norm = p.grad.detach().data.norm(2)
+                            total_norm[key] += param_norm.item() ** 2
+                        total_norm[key] = total_norm[key] ** 0.5
 
-                for p in model.predictor.duration_proj.parameters():
-                    if p.grad is not None:
-                        p.grad *= slmadv_params.scale
+                    # gradient scaling
+                    if total_norm["predictor"] > slmadv_params.thresh:
+                        for key in model.keys():
+                            for p in model[key].parameters():
+                                if p.grad is not None:
+                                    p.grad *= 1 / total_norm["predictor"]
 
-                for p in model.predictor.lstm.parameters():
-                    if p.grad is not None:
-                        p.grad *= slmadv_params.scale
-
-                if diffusion_enabled:
-                    for p in model.diffusion.parameters():
+                    for p in model.predictor.duration_proj.parameters():
                         if p.grad is not None:
                             p.grad *= slmadv_params.scale
 
-                optimizer.step("bert_encoder")
-                optimizer.step("bert")
-                optimizer.step("predictor")
-                if diffusion_enabled:
-                    optimizer.step("diffusion")
+                    for p in model.predictor.lstm.parameters():
+                        if p.grad is not None:
+                            p.grad *= slmadv_params.scale
 
-                # SLM discriminator loss
-                if d_loss_slm != 0:
-                    optimizer.zero_grad()
-                    # d_loss_slm only trains the WavLM discriminator on detached
-                    # audio/features, so retaining the generator graph here is
-                    # unnecessary and can accumulate MPS unified memory.
-                    d_loss_slm.backward()
-                    optimizer.step("wd")
+                    if diffusion_enabled:
+                        for p in model.diffusion.parameters():
+                            if p.grad is not None:
+                                p.grad *= slmadv_params.scale
 
-                d_loss_slm_value = (
-                    d_loss_slm.item() if torch.is_tensor(d_loss_slm) else d_loss_slm
-                )
-                loss_gen_lm_value = (
-                    loss_gen_lm.item() if torch.is_tensor(loss_gen_lm) else loss_gen_lm
-                )
-                del slm_out, y_pred, loss_gen_lm, d_loss_slm
-                d_loss_slm, loss_gen_lm = d_loss_slm_value, loss_gen_lm_value
+                    optimizer.step("bert_encoder")
+                    optimizer.step("bert")
+                    optimizer.step("predictor")
+                    if diffusion_enabled:
+                        optimizer.step("diffusion")
+
+                    # SLM discriminator loss
+                    if d_loss_slm != 0:
+                        optimizer.zero_grad()
+                        # d_loss_slm only trains the WavLM discriminator on detached
+                        # audio/features, so retaining the generator graph here is
+                        # unnecessary and can accumulate MPS unified memory.
+                        d_loss_slm.backward()
+                        optimizer.step("wd")
+
+                    d_loss_slm_value = (
+                        d_loss_slm.item() if torch.is_tensor(d_loss_slm) else d_loss_slm
+                    )
+                    loss_gen_lm_value = (
+                        loss_gen_lm.item() if torch.is_tensor(loss_gen_lm) else loss_gen_lm
+                    )
+                    del slm_out, y_pred, loss_gen_lm, d_loss_slm
+                    d_loss_slm, loss_gen_lm = d_loss_slm_value, loss_gen_lm_value
 
             else:
                 d_loss_slm, loss_gen_lm = 0, 0
@@ -1491,8 +1513,8 @@ def main(config_path, dataset, name, resume):
                         d_gt = s2s_attn_mono.sum(axis=-1).detach()
 
                     # Same duration conditioning as training: the whole target
-                    # utterance, tiled to a fixed padding-free width.
-                    s = model.predictor_encoder(_style_ref_crop(mels, 0).unsqueeze(1))
+                    # utterance, with the collation padding masked.
+                    s = model.predictor_encoder(mels.unsqueeze(1), mel_input_length)
 
                     bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
                     d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
@@ -1533,11 +1555,13 @@ def main(config_path, dataset, name, resume):
                     p_en = torch.stack(p_en)
                     gt = torch.stack(gt).detach()
 
-                    val_ref_style_mels = _style_ref_crop(
+                    val_ref_style_mels, val_ref_style_lengths = _style_ref_input(
                         ref_mels.detach(), style_ref_crop_frames, random_start=False
                     )
-                    s_dur = model.predictor_encoder(
-                        val_ref_style_mels.unsqueeze(1) if multispeaker else gt.unsqueeze(1)
+                    s_dur = (
+                        model.predictor_encoder(val_ref_style_mels.unsqueeze(1), val_ref_style_lengths)
+                        if multispeaker
+                        else model.predictor_encoder(gt.unsqueeze(1))
                     )
 
                     F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s_dur)
@@ -1559,8 +1583,10 @@ def main(config_path, dataset, name, resume):
 
                     loss_dur /= texts.size(0)
 
-                    s = model.style_encoder(
-                        val_ref_style_mels.unsqueeze(1) if multispeaker else gt.unsqueeze(1)
+                    s = (
+                        model.style_encoder(val_ref_style_mels.unsqueeze(1), val_ref_style_lengths)
+                        if multispeaker
+                        else model.style_encoder(gt.unsqueeze(1))
                     )
 
                     y_rec = model.decoder(en, F0_fake, N_fake, s)
@@ -1658,7 +1684,7 @@ def main(config_path, dataset, name, resume):
         if eval_device != device:
             _restore_training_devices()
             stft_loss = stft_loss.to(device)
-        _ = [model[key].train() for key in model]
+        _set_train_mode(model)
         # ─────────────────────────────────────────────────────────────────────
 
 

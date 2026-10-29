@@ -59,19 +59,19 @@ Requirements:
 - Typical clip duration: 2–30s
 - Keep phoneme strings compatible with Kokoro symbols (see [Phoneme Compatibility](ARCHITECTURE.md#german-phoneme-compatibility))
 
-German G2P example:
+Phonemes come from `phonemizer` with the `espeak` backend. `prepare_dataset.py` reads a `lang-code/speaker/*.wav + *.txt` layout, uses each folder name as the espeak language code, and writes the lists plus `symbols.json` (symbols missing from the base vocab, such as `ʏ`, are added rather than remapped):
 
-```python
-from misaki import espeak
-
-g2p = espeak.EspeakG2P(language='en-us')
-phonemes, _ = g2p(text)
-phonemes = phonemes.replace('ʏ', 'y')  # ʏ not in Kokoro vocab
+```bash
+uv run python prepare_dataset.py /path/to/dataset
 ```
 
-Use:
-- `scripts/prepare_dataset.py`
-- `scripts/prepare_training.py`
+At inference, use the same frontend so phonemes match training:
+
+```python
+KPipeline(lang_code='de', model=kmodel, g2p_backend='phonemizer')
+```
+
+`scripts/test_inference.py` and `scripts/speaker_similarity.py` default to `--g2p-backend phonemizer`.
 
 ## 3) Prepare Base Weights
 

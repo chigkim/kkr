@@ -112,8 +112,9 @@ def run_inference(
     voicepack_path: str,
     config_path: str,
     output_dir: str,
-    lang_code: str = "a",
+    lang_code: str = "en-us",
     device: str = "auto",
+    g2p_backend: str = "phonemizer",
 ):
     """Run inference on the test set."""
     import torch
@@ -132,7 +133,9 @@ def run_inference(
     kmodel = kmodel.to(device).eval()
 
     # Create pipeline with specified lang_code
-    pipeline = KPipeline(lang_code=lang_code, repo_id="hexgrad/Kokoro-82M", model=kmodel)
+    pipeline = KPipeline(
+        lang_code=lang_code, repo_id="hexgrad/Kokoro-82M", model=kmodel, g2p_backend=g2p_backend
+    )
 
     # Load voicepack
     print(f"Loading voicepack: {voicepack_path}")
@@ -144,7 +147,9 @@ def run_inference(
 
     # Select sentences based on lang_code
     test_sentences = (
-        ENGLISH_TEST_SENTENCES if lang_code in ["a", "b"] else GERMAN_TEST_SENTENCES
+        ENGLISH_TEST_SENTENCES
+        if lang_code in ["a", "b"] or lang_code.startswith("en")
+        else GERMAN_TEST_SENTENCES
     )
 
     # Generate audio for each test sentence
@@ -195,8 +200,15 @@ def main():
     )
     parser.add_argument(
         "--lang-code",
-        default="a",
-        help="Language code: a (American English), d (German), etc. (default: a)",
+        default="en-us",
+        help="Language code. With --g2p-backend phonemizer, an espeak language such as en-us, de, fr-fr; "
+        "with kokoro, a Kokoro code such as a or d (default: en-us)",
+    )
+    parser.add_argument(
+        "--g2p-backend",
+        default="phonemizer",
+        choices=["phonemizer", "kokoro"],
+        help="Inference G2P; phonemizer matches lists from prepare_dataset.py (default: phonemizer)",
     )
     parser.add_argument(
         "--config",
@@ -233,6 +245,7 @@ def main():
         output_dir=args.output_dir,
         lang_code=args.lang_code,
         device=args.device,
+        g2p_backend=args.g2p_backend,
     )
 
 

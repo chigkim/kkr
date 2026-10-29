@@ -208,6 +208,21 @@ class UpSample(nn.Module):
             )
 
 
+def _time_mask(lengths, width):
+    '''[B] lengths -> [B, 1, 1, width] boolean mask of valid time steps.'''
+    return (torch.arange(width, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)).view(-1, 1, 1, width)
+
+
+def _mask_time(x, lengths):
+    return x * _time_mask(lengths, x.size(-1)).to(x.dtype)
+
+
+def _downsampled_lengths(lengths, layer_type):
+    if layer_type == 'half':
+        return (lengths + 1) // 2
+    return lengths
+
+
 class ResBlk(nn.Module):
     def __init__(
         self,
@@ -243,21 +258,34 @@ class ResBlk(nn.Module):
             x = self.downsample(x)
         return x
 
-    def _residual(self, x):
+    def _residual(self, x, lengths=None):
         if self.normalize:
             x = self.norm1(x)
         x = self.actv(x)
         x = self.conv1(x)
+        if lengths is not None:
+            x = _mask_time(x, lengths)
         x = self.downsample_res(x)
+        if lengths is not None:
+            x = _mask_time(x, _downsampled_lengths(lengths, self.downsample.layer_type))
         if self.normalize:
             x = self.norm2(x)
         x = self.actv(x)
         x = self.conv2(x)
         return x
 
-    def forward(self, x):
-        x = self._shortcut(x) + self._residual(x)
-        return x / math.sqrt(2)  # unit variance
+    def forward(self, x, lengths=None):
+        '''lengths: optional valid time lengths [B] of a zero-padded input.
+
+        Activations past each length are zeroed, so the valid region matches
+        what an unpadded input of that length produces (convolutions see zero
+        padding at the boundary either way). Instance norm is not masked.
+        '''
+        x = self._shortcut(x) + self._residual(x, lengths)
+        x = x / math.sqrt(2)  # unit variance
+        if lengths is not None:
+            x = _mask_time(x, _downsampled_lengths(lengths, self.downsample.layer_type))
+        return x
 
 
 class StyleEncoder(nn.Module):
@@ -280,8 +308,33 @@ class StyleEncoder(nn.Module):
 
         self.unshared = nn.Linear(dim_out, style_dim)
 
-    def forward(self, x):
-        h = self.shared(x)
+    def forward(self, x, lengths=None):
+        '''x: [B, 1, n_mels, T]. lengths: optional valid frame counts [B].
+
+        Without lengths the whole width is averaged, as in upstream. With
+        lengths, padded frames are masked through the network and excluded
+        from the final average, so a padded batch gives (nearly) the style of
+        each unpadded clip.
+        '''
+        if lengths is None:
+            h = self.shared(x)
+        else:
+            lengths = lengths.to(x.device).long()
+            h = _mask_time(x, lengths)
+            for block in self.shared:
+                if isinstance(block, ResBlk):
+                    h = block(h, lengths)
+                    lengths = _downsampled_lengths(lengths, block.downsample.layer_type)
+                elif isinstance(block, nn.AdaptiveAvgPool2d):
+                    valid = _time_mask(lengths.clamp(min=1), h.size(-1)).to(h.dtype)
+                    h = (h * valid).sum(dim=(2, 3), keepdim=True) / (valid.sum(dim=-1, keepdim=True) * h.size(2))
+                elif isinstance(block, nn.Conv2d):
+                    h = block(h)
+                    # stride-1 conv: an unpadded 'valid' conv shortens the sequence
+                    lengths = lengths + 2 * block.padding[1] - (block.kernel_size[1] - 1)
+                    h = _mask_time(h, lengths.clamp(min=0))
+                else:
+                    h = block(h)
         h = h.view(h.size(0), -1)
         s = self.unshared(h)
 

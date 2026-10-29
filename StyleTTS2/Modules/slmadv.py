@@ -15,6 +15,14 @@ def _fit_audio(x, length):
     return x
 
 
+def _fit_audio_pair(a, b, length):
+    '''_fit_audio for two time-aligned clips, with one shared crop offset.'''
+    if length is None or length <= 0:
+        return a, b
+    n = min(a.size(-1), b.size(-1))
+    return _fit_audio(torch.cat([a[..., :n], b[..., :n]], dim=0), length).split([a.size(0), b.size(0)], dim=0)
+
+
 class SLMAdversarialLoss(torch.nn.Module):
     def __init__(
         self,
@@ -30,6 +38,7 @@ class SLMAdversarialLoss(torch.nn.Module):
         fixed_mel_len=None,
         fixed_crop_size=None,
         conv_on_cpu=False,
+        length_reg_ratio=0.75,
     ):
         super(SLMAdversarialLoss, self).__init__()
         self.model = model
@@ -46,6 +55,7 @@ class SLMAdversarialLoss(torch.nn.Module):
         self.fixed_mel_len = fixed_mel_len
         self.fixed_crop_size = fixed_crop_size
         self.conv_on_cpu = conv_on_cpu
+        self.length_reg_ratio = length_reg_ratio
 
     def forward(
         self,
@@ -228,8 +238,9 @@ class SLMAdversarialLoss(torch.nn.Module):
         if fixed_crop_size:
             wav = _fit_audio(wav, fixed_crop_size)
             y_pred = _fit_audio(y_pred, fixed_crop_size)
-            y_rec_gt_fixed = _fit_audio(y_rec_gt, fixed_crop_size)
-            y_rec_gt_pred_fixed = _fit_audio(y_rec_gt_pred, fixed_crop_size)
+            # The recording and its reconstruction are compared frame by
+            # frame below, so they must share one crop offset.
+            y_rec_gt_fixed, y_rec_gt_pred_fixed = _fit_audio_pair(y_rec_gt, y_rec_gt_pred, fixed_crop_size)
         else:
             y_rec_gt_fixed = y_rec_gt
             y_rec_gt_pred_fixed = y_rec_gt_pred
@@ -242,36 +253,30 @@ class SLMAdversarialLoss(torch.nn.Module):
             else:
                 use_rec = False
 
-            crop_size = fixed_crop_size if fixed_crop_size else min(wav.size(-1), y_pred.size(-1))
             if use_rec:  # use reconstructed (shorter lengths), do length invariant regularization
-                if wav.size(-1) > y_pred.size(-1):
-                    real_GP = wav[:, :, :crop_size]
-                    out_crop = self.wl.discriminator_forward(real_GP.detach().squeeze(1))
-                    out_org = self.wl.discriminator_forward(wav.detach().squeeze(1))
-                    loss_reg = F.l1_loss(out_crop, out_org[..., : out_crop.size(-1)])
-
-                    if np.random.randint(0, 2) == 0:
-                        d_loss = self.wl.discriminator(
-                            real_GP.detach().squeeze(1), y_pred.detach().squeeze(1)
-                        ).mean()
-                    else:
-                        d_loss = self.wl.discriminator(
-                            wav.detach().squeeze(1), y_pred.detach().squeeze(1)
-                        ).mean()
+                # Upstream crops the longer clip to the shorter one's length.
+                # With fixed-size clips both lengths match, so that crop was
+                # the whole clip and loss_reg was always 0; crop a fixed
+                # shorter prefix of either clip instead (still one shape).
+                if wav.size(-1) != y_pred.size(-1):
+                    crop_real = wav.size(-1) > y_pred.size(-1)
+                    crop_size = min(wav.size(-1), y_pred.size(-1))
                 else:
-                    real_GP = y_pred[:, :, :crop_size]
-                    out_crop = self.wl.discriminator_forward(real_GP.detach().squeeze(1))
-                    out_org = self.wl.discriminator_forward(y_pred.detach().squeeze(1))
-                    loss_reg = F.l1_loss(out_crop, out_org[..., : out_crop.size(-1)])
+                    crop_real = np.random.randint(0, 2) == 0
+                    crop_size = max(1, int(wav.size(-1) * self.length_reg_ratio))
+                full = wav if crop_real else y_pred
+                real_GP = full[:, :, :crop_size]
+                out_crop = self.wl.discriminator_forward(real_GP.detach().squeeze(1))
+                out_org = self.wl.discriminator_forward(full.detach().squeeze(1))
+                loss_reg = F.l1_loss(out_crop, out_org[..., : out_crop.size(-1)])
 
-                    if np.random.randint(0, 2) == 0:
-                        d_loss = self.wl.discriminator(
-                            wav.detach().squeeze(1), real_GP.detach().squeeze(1)
-                        ).mean()
-                    else:
-                        d_loss = self.wl.discriminator(
-                            wav.detach().squeeze(1), y_pred.detach().squeeze(1)
-                        ).mean()
+                if np.random.randint(0, 2) == 0:
+                    real, fake = (real_GP, y_pred) if crop_real else (wav, real_GP)
+                else:
+                    real, fake = wav, y_pred
+                d_loss = self.wl.discriminator(
+                    real.detach().squeeze(1), fake.detach().squeeze(1)
+                ).mean()
 
                 # regularization (ignore length variation)
                 d_loss += loss_reg

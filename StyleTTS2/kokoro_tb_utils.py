@@ -15,48 +15,36 @@ import torchaudio
 
 logger = logging.getLogger(__name__)
 
-# English phonetic test sentences — standard Kokoro-style checks
-TEST_SENTENCES = [
-    "The quick brown fox jumps over the lazy dog.",
-    "Please call Stella and ask her to bring these things with her from the store.",
-    "When the sunlight strikes raindrops in the air, they act as a prism and form a rainbow.",
-    "The rainbow is a division of white light into many beautiful colors.",
-    "Do you think it's possible for us to meet tomorrow morning?",
-    "That is exactly one hundred twenty-three million dollars.",
-    "Life is like a box of chocolates, you never know what you're going to get.",
-]
+def prepare_test_tokens(text_cleaner, ood_path, n_sentences=8, min_chars=40, max_chars=200, seed=0):
+    """Pick fixed held-out phoneme strings from the OOD list and tokenize them.
 
+    The OOD list holds phonemes from the dataset's own frontend
+    (prepare_dataset.py), so previews use the training language and
+    phoneme conventions without running G2P here. The same lines are chosen
+    every run (fixed seed).
 
-def prepare_test_tokens(text_cleaner):
-    """Convert English test sentences to token ID lists via espeak G2P.
-
-    Returns a list of (display_text, token_ids) tuples.
+    Returns a list of (display_text, token_ids) tuples; display_text is the
+    phoneme string.
     """
     try:
-        from espeak_compat import configure_espeak
-        configure_espeak()
-        from misaki import espeak
-
-        g2p = espeak.EspeakG2P(language="en-us")
-    except Exception as e:
-        logger.warning(f"Could not load English G2P for TensorBoard inference: {e}")
+        rows = [line.split('|') for line in Path(ood_path).read_text(encoding='utf-8').splitlines() if line.strip()]
+        # Same format rule as meldataset: phonemes, or wav|phonemes|speaker
+        idx = 1 if rows and '.wav' in rows[0][0] else 0
+        lines = [row[idx].strip() for row in rows if len(row) > idx]
+    except OSError as e:
+        logger.warning(f"Could not read OOD texts for TensorBoard inference: {e}")
         return []
+    lines = sorted({line for line in lines if min_chars <= len(line) <= max_chars})
+    random.Random(seed).shuffle(lines)
 
     result = []
-    for text in TEST_SENTENCES:
-        try:
-            g2p_out = g2p(text)
-            ipa = g2p_out[0] if isinstance(g2p_out, tuple) else g2p_out
-            ipa = ipa.replace("\u028f", "y")  # ʏ → y fixup
-            token_ids = text_cleaner(ipa)
-            if not token_ids or len(token_ids) > 510:
-                logger.warning(
-                    f"Skipping test sentence (token length {len(token_ids)}): {text[:40]}"
-                )
-                continue
-            result.append((text, token_ids))
-        except Exception as e:
-            logger.warning(f'G2P failed for test sentence "{text[:40]}": {e}')
+    for ipa in lines:
+        token_ids = text_cleaner(ipa)
+        if not token_ids or len(token_ids) > 510:
+            continue
+        result.append((ipa, token_ids))
+        if len(result) >= n_sentences:
+            break
     return result
 
 

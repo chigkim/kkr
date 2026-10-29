@@ -293,25 +293,24 @@ def _crop_adversarial_audio(y, y_hat, segment_size):
     return y[..., :length], y_hat[..., :length]
 
 
-def _style_ref_crop(ref_mels, crop_frames, random_start=True):
-    '''Fixed-width circular time crop for style/prosody encoder inputs.
+def _style_ref_input(ref_mels, crop_frames, random_start=True):
+    '''Padding-free style/prosody encoder input: returns (mels, lengths).
 
-    The collater zero-pads mels to the fixed MPS width, but the style encoders
-    average over time without masking, so padding (which is not silence in
-    normalized log-mel space) dilutes the style vector and mismatches
-    inference, where styles come from unpadded mels.  A circular crop inside
-    the true length keeps the shape fixed and never shows padding.  True
-    lengths are recovered from the content: padded frames are exactly zero.
+    The collater zero-pads mels to the fixed MPS width. Padding is not
+    silence in normalized log-mel space, and the style encoders average over
+    time, so unmasked padding dilutes the style vector and mismatches
+    inference, where styles come from unpadded mels. True lengths are
+    recovered from the content: padded frames are exactly zero.
 
-    crop_frames <= 0 fills the whole input width by tiling the true-length
-    content from its start, so the encoder sees the full utterance and no
-    padding.
+    crop_frames <= 0 keeps the whole clip and returns its lengths, which the
+    encoders use to mask padding (StyleEncoder(x, lengths)). crop_frames > 0
+    takes a fixed-width circular crop inside the true length; it holds no
+    padding, so lengths is None.
     '''
-    if not crop_frames or crop_frames <= 0:
-        crop_frames = ref_mels.size(-1)
-        random_start = False
-    crop_frames = int(crop_frames)
     lengths = (ref_mels.abs().sum(dim=1) > 0).sum(dim=-1).clamp(min=1)
+    if not crop_frames or crop_frames <= 0:
+        return ref_mels, lengths
+    crop_frames = int(crop_frames)
     if random_start:
         starts = (torch.rand(ref_mels.size(0), device=ref_mels.device) * lengths).long()
     else:
@@ -319,7 +318,7 @@ def _style_ref_crop(ref_mels, crop_frames, random_start=True):
     base = torch.arange(crop_frames, device=ref_mels.device).unsqueeze(0)
     idx = (starts.unsqueeze(1) + base) % lengths.unsqueeze(1)
     idx = idx.unsqueeze(1).expand(ref_mels.size(0), ref_mels.size(1), crop_frames)
-    return torch.gather(ref_mels, dim=-1, index=idx)
+    return torch.gather(ref_mels, dim=-1, index=idx), None
 
 
 def _s2s_loss(s2s_pred, texts, input_lengths):
@@ -595,7 +594,7 @@ def main(config_path, dataset, name, resume):
     # ── Kokoro-faithful TensorBoard inference setup ───────────────────────────
     if accelerator.is_main_process:
         text_cleaner = TextCleaner()
-        _test_tokens = prepare_test_tokens(text_cleaner)
+        _test_tokens = prepare_test_tokens(text_cleaner, OOD_data)
         if _test_tokens:
             log_info(
                 f"TensorBoard inference: prepared {len(_test_tokens)} test sentences"
@@ -636,6 +635,7 @@ def main(config_path, dataset, name, resume):
             gc.collect()
             torch.mps.empty_cache()
         running_loss = 0
+        running_steps = 0
         skipped_short_batches = 0
         dropped_short_samples = 0
         start_time = time.time()
@@ -763,8 +763,8 @@ def main(config_path, dataset, name, resume):
                     mels[bib, :, (s0 * 2) : ((s0 + mel_len) * 2)] for bib, s0 in enumerate(starts)
                 ]).detach()
             # Use actual reference from a different clip; the circular crop is
-            # padding-free and fixed-shape (see _style_ref_crop).
-            st = _style_ref_crop(ref_mels.detach(), style_ref_crop_frames)
+            # padding-free and fixed-shape (see _style_ref_input).
+            st, st_lengths = _style_ref_input(ref_mels.detach(), style_ref_crop_frames)
 
             # clip too short to be used by the style encoder
             if gt.shape[-1] < 80:
@@ -774,8 +774,10 @@ def main(config_path, dataset, name, resume):
                 real_norm = log_norm(gt.unsqueeze(1)).squeeze(1).detach()
                 F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
 
-            s = model.style_encoder(
-                st.unsqueeze(1) if multispeaker else gt.unsqueeze(1)
+            s = (
+                model.style_encoder(st.unsqueeze(1), st_lengths)
+                if multispeaker
+                else model.style_encoder(gt.unsqueeze(1))
             )
             timbre_spk_loss, timbre_spk_ce, timbre_center_loss, timbre_margin_loss = speaker_separation_loss(
                 s,
@@ -838,6 +840,7 @@ def main(config_path, dataset, name, resume):
                 g_loss = loss_mel + timbre_spk_loss
 
             running_loss += accelerator.gather(loss_mel).mean().item()
+            running_steps += 1
 
             accelerator.backward(g_loss)
 
@@ -882,7 +885,8 @@ def main(config_path, dataset, name, resume):
                 )
 
             if (i + 1) % log_interval == 0 and accelerator.is_main_process:
-                avg_mel_loss = running_loss / log_interval
+                # skipped batches add no loss, so average over the steps that ran
+                avg_mel_loss = running_loss / max(running_steps, 1)
                 elapsed = _format_elapsed(time.time() - start_time)
                 memory_line = _torch_memory_report_line(device)
                 step_message = (
@@ -931,6 +935,7 @@ def main(config_path, dataset, name, resume):
                 writer.add_scalar("train/speaker_margin_loss", timbre_margin_loss, iters)
 
                 running_loss = 0
+                running_steps = 0
 
         if (skipped_short_batches or dropped_short_samples) and accelerator.is_main_process:
             log_info(
@@ -1032,11 +1037,11 @@ def main(config_path, dataset, name, resume):
                 gt = torch.stack(gt).detach()
 
                 F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1))
-                s = model.style_encoder(
-                    _style_ref_crop(ref_mels.detach(), style_ref_crop_frames, random_start=False).unsqueeze(1)
-                    if multispeaker
-                    else gt.unsqueeze(1)
-                )
+                if multispeaker:
+                    st, st_lengths = _style_ref_input(ref_mels.detach(), style_ref_crop_frames, random_start=False)
+                    s = model.style_encoder(st.unsqueeze(1), st_lengths)
+                else:
+                    s = model.style_encoder(gt.unsqueeze(1))
                 real_norm = log_norm(gt.unsqueeze(1)).squeeze(1)
                 y_rec = model.decoder(en, F0_real, real_norm, s)
 

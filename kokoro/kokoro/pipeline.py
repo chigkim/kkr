@@ -142,7 +142,9 @@ class KPipeline:
                     preserve_punctuation=False,
                     njobs=1,
                 )[0]
-                return phonemes.replace('\u028f', 'y'), None
+                # Same phonemes as prepare_dataset.py, which keeps
+                # symbols missing from the base vocab (e.g. ʏ) as new tokens.
+                return phonemes, None
 
             self.g2p = phonemizer_g2p
         elif lang_code in 'ab':
@@ -464,6 +466,9 @@ class KPipeline:
                         continue
                         
                     ps, _ = self.g2p(chunk)
+                    if model and self.g2p_backend == 'phonemizer' and '\u028f' in ps and '\u028f' not in model.vocab:
+                        # Base Kokoro vocab has no ʏ; KModel would drop it.
+                        ps = ps.replace('\u028f', 'y')
                     if not ps:
                         continue
                     elif len(ps) > 510:

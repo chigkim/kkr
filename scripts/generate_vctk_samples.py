@@ -41,7 +41,7 @@ def main():
     parser.add_argument('--config', default='dataset/config.json', help='Kokoro config.json (prepare_dataset.py emits one with the expanded vocab)')
     parser.add_argument('--output-dir', default='generated/vctk_samples', help='Output directory')
     parser.add_argument('--lang-code', default='en-us', help='Language code. For --g2p-backend phonemizer, use a phonemizer/espeak language such as en-us, en-gb, de, fr-fr.')
-    parser.add_argument('--g2p-backend', default='kokoro', choices=['kokoro', 'phonemizer'], help='Inference G2P backend; use phonemizer to match phonemizer/espeak training lists')
+    parser.add_argument('--g2p-backend', default='phonemizer', choices=['kokoro', 'phonemizer'], help='Inference G2P backend; use phonemizer to match phonemizer/espeak training lists')
     parser.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda', 'mps'], help='Inference device')
     args = parser.parse_args()
 

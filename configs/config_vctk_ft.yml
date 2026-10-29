@@ -16,7 +16,7 @@ fixed_training_mel_len_frames: 96  # near-original fixed decoder crop length; MP
 fixed_mps_text_length: 512         # pin text/predictor graph width on MPS
 fixed_mps_mel_length: 1152         # pin mel/attention graph width on MPS (covers VCTK max ~1060)
 mps_safe_gather_crop: true         # crop decoder windows via tensor gather instead of per-start strided slices
-style_ref_crop_frames: 0           # 0 = style/prosody encoders see the full reference mel, tiled to the fixed width so no padding is shown. The 240-frame random crop (2f683fa) is the prime suspect for weak speaker conditioning: a per-step-changing style input teaches the model to discount it.
+style_ref_crop_frames: 0           # 0 = style/prosody encoders see the full reference mel; collation padding is masked inside the encoders (StyleEncoder lengths). The 240-frame random crop (2f683fa) is the prime suspect for weak speaker conditioning: a per-step-changing style input teaches the model to discount it.
 mps_native_lstm: false             # CPU-LSTM workaround is ~5-8% faster in Stage 2; true = keep packed LSTMs on MPS
 aligner_device: "mps"             # experiment: run text aligner on MPS
 wavlm_device: "mps"               # experiment: run WavLM perceptual loss on MPS
@@ -108,7 +108,7 @@ loss_params:
   lambda_F0: 1.0                    # F0 (pitch) prediction loss
   lambda_norm: 1.0                  # energy/norm prediction loss
   lambda_s2s: 1.0                   # sequence-to-sequence loss
-  lambda_mono: 1.0                  # monotonic alignment loss
+  lambda_mono: 0.5                  # monotonic alignment loss; averaged over valid cells, so 0.5 matches upstream's padded-grid mean at batch size 8 (about 47% of cells valid)
   lambda_slm: 1.0                   # WavLM perceptual loss
   slmadv_enabled: false             # off: WavLM grad-forward in slmadv generator leaks on MPS (~2.5 GB/epoch in-section); root-causing via standalone repro
   lambda_diff: 0.0                  # diffusion loss (0 = disabled, no diffusion)
