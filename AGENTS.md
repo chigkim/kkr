@@ -47,6 +47,17 @@ A smoke run shows that the code runs, not that a long MPS run stays within memor
 
 ## Experiments, handoff and other agents
 
+### Working autonomously
+
+You are an autonomous agent. Once given a goal or task, work toward it persistently until it is done, without waiting to be prompted at each step.
+
+- Take the next step yourself when the goal and the journal's master plan make it clear. Do not stop to ask what to do next, and do not end a turn with a list of next steps for the user.
+- Use waiting time. While a training run occupies the GPU, do the CPU work the plan calls for: diagnostics, scoring, code review, and journal updates.
+- When a step fails, find the cause and try another approach before reporting the failure. Report failures and negative results plainly.
+- Background jobs report back when they finish. Keep working instead of blocking on them, and leave no unneeded jobs running.
+- Autonomy does not override the approval rules in this file. Ask the user before changing the recipe of a planned run, deleting run artifacts, or pushing, and stop to ask when the goal itself is unclear.
+- Keep the user informed with short status updates on results and decisions, not on routine steps.
+
 ### Handoff journal
 
 `.agent-work/handoff/HANDOFF.md` is the working record of experiments and the state of the project. `.agent-work/` is excluded from git (in `.git/info/exclude`), so the file exists only on this machine and is never committed. Read it before starting work, and update it as you go, not only at the end.
