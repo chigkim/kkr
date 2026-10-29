@@ -69,10 +69,12 @@ def phonemize(texts, language, g2p_backend='phonemizer'):
             backend='espeak',
             strip=True,
             with_stress=True,
-            preserve_punctuation=False,
+            preserve_punctuation=True,  # pauses and question intonation; base Kokoro was trained with punctuation
+            punctuation_marks=';:,.!?—…"()“”',  # only marks in the base Kokoro vocab, so none become new tokens
+            language_switch='remove-flags',  # espeak would otherwise insert (en)…(de) markers as tokens
             njobs=1,
         )
-        return list(phonemes)
+        return [' '.join(p.split()) for p in phonemes]
 
     try:
         from espeak_compat import configure_espeak

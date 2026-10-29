@@ -59,7 +59,7 @@ Requirements:
 - Typical clip duration: 2–30s
 - Keep phoneme strings compatible with Kokoro symbols (see [Phoneme Compatibility](ARCHITECTURE.md#german-phoneme-compatibility))
 
-Phonemes come from `phonemizer` with the `espeak` backend. `prepare_dataset.py` reads a `lang-code/speaker/*.wav + *.txt` layout, uses each folder name as the espeak language code, and writes the lists plus `symbols.json` (symbols missing from the base vocab, such as `ʏ`, are added rather than remapped):
+Phonemes come from `phonemizer` with the `espeak` backend. `prepare_dataset.py` reads a `lang-code/speaker/*.wav + *.txt` layout, uses each folder name as the espeak language code, and writes the lists plus `symbols.json` (symbols missing from the base vocab, such as `ʏ`, are added rather than remapped). Punctuation in the base vocab (`;:,.!?—…"()“”`) is kept as tokens, as in base Kokoro, so the model can learn pauses and question intonation; espeak language-switch markers such as `(en)` are removed:
 
 ```bash
 uv run python prepare_dataset.py /path/to/dataset

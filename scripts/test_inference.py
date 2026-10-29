@@ -212,8 +212,8 @@ def main():
     )
     parser.add_argument(
         "--config",
-        default="training/config.json",
-        help="Path to Kokoro config.json",
+        default="dataset/config.json",
+        help="Path to Kokoro config.json; use the one prepare_dataset.py wrote so the vocab matches the checkpoint (default: dataset/config.json)",
     )
     parser.add_argument(
         "--output-dir",

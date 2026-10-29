@@ -26,6 +26,29 @@ def maximum_path(neg_cent, mask):
   maximum_path_c(path, neg_cent, t_t_max, t_s_max)
   return torch.from_numpy(path).to(device=device, dtype=dtype)
 
+def run_text_aligner(text_aligner, mels, mel_lengths, texts, n_down, bucket=64):
+    '''Run the text aligner on mels cut to the batch's longest clip.
+
+    ASRCNN's GroupNorm normalises over the whole time axis, so the fixed-width
+    MPS collation padding (1152 frames) changed which token each frame aligned
+    to. The width is rounded up to `bucket` frames to keep the number of MPS
+    graph shapes small, and the attention is zero-padded back to the full
+    width so the fixed-shape code downstream is unchanged.
+
+    Returns (s2s_pred, s2s_attn) with s2s_attn [B, text, mel_frames // 2**n_down].
+    '''
+    full = mels.size(-1)
+    step = max(int(bucket), 2**n_down)
+    width = min(full, -(-int(mel_lengths.max().item()) // step) * step)
+    frames = mel_lengths.to(mels.device) // (2**n_down)
+    mask = torch.arange(width // (2**n_down), device=mels.device).unsqueeze(0) >= frames.unsqueeze(1)
+    _, s2s_pred, s2s_attn = text_aligner(mels[..., :width], mask, texts)
+    pad = full // (2**n_down) - s2s_attn.size(-1)
+    if pad > 0:
+        s2s_attn = F.pad(s2s_attn, (0, pad))
+    return s2s_pred, s2s_attn
+
+
 def get_data_path_list(train_path=None, val_path=None):
     if train_path is None:
         train_path = "Data/train_list.txt"

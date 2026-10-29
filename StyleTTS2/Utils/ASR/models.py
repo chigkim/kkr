@@ -122,10 +122,11 @@ class ASRS2S(nn.Module):
         texts_input.shape = (B, T)
         """
         self.initialize_decoder_states(memory, memory_mask)
-        # text random mask
-        random_mask = (torch.rand(text_input.shape) < self.random_mask).to(text_input.device)
+        # text random mask (training augmentation only; frozen Stage 2 targets and validation must be deterministic)
         _text_input = text_input.clone()
-        _text_input.masked_fill_(random_mask, self.unk_index)
+        if self.training:
+            random_mask = (torch.rand(text_input.shape) < self.random_mask).to(text_input.device)
+            _text_input.masked_fill_(random_mask, self.unk_index)
         decoder_inputs = self.embedding(_text_input).transpose(0, 1) # -> [T, B, channel]
         start_embedding = self.embedding(
             torch.LongTensor([self.sos]*decoder_inputs.size(1)).to(decoder_inputs.device))

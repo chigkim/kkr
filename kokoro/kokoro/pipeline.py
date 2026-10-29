@@ -139,9 +139,12 @@ class KPipeline:
                     backend='espeak',
                     strip=True,
                     with_stress=True,
-                    preserve_punctuation=False,
+                    preserve_punctuation=True,  # pauses and question intonation; base Kokoro was trained with punctuation
+                    punctuation_marks=';:,.!?—…"()“”',  # only marks in the base Kokoro vocab, so none become new tokens
+                    language_switch='remove-flags',  # espeak would otherwise insert (en)…(de) markers as tokens
                     njobs=1,
                 )[0]
+                phonemes = ' '.join(phonemes.split())
                 # Same phonemes as prepare_dataset.py, which keeps
                 # symbols missing from the base vocab (e.g. ʏ) as new tokens.
                 return phonemes, None

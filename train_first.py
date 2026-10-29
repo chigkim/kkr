@@ -420,6 +420,7 @@ def main(config_path, dataset, name, resume):
     fixed_training_mel_len_frames = min(fixed_training_mel_len_frames, max_len // 2)
     if fixed_training_mel_len:
         log_info(f"Using fixed Stage 1 training mel length: {fixed_training_mel_len_frames} frames")
+    aligner_bucket_frames = int(config.get('aligner_bucket_frames', 64))
     fixed_mps_text_length = int(config.get('fixed_mps_text_length', 0) or 0)
     fixed_mps_mel_length = int(config.get('fixed_mps_mel_length', 0) or 0)
     mps_safe_gather_crop = bool(config.get('mps_safe_gather_crop', device == 'mps'))
@@ -683,7 +684,9 @@ def main(config_path, dataset, name, resume):
                 text_mask = _length_to_text_mask(input_lengths, texts.size(1)).to(texts.device)
 
 
-            ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
+            s2s_pred, s2s_attn = run_text_aligner(
+                model.text_aligner, mels, mel_input_length, texts, n_down, aligner_bucket_frames
+            )
 
             s2s_attn = s2s_attn.transpose(-1, -2)
             s2s_attn = s2s_attn[..., 1:]
@@ -973,7 +976,9 @@ def main(config_path, dataset, name, resume):
                 with torch.no_grad():
                     aligner_width = mels.size(2) // (2**n_down)
                     mask = _length_to_width_mask(mel_input_length // (2**n_down), aligner_width).to(device)
-                    ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
+                    s2s_pred, s2s_attn = run_text_aligner(
+                        model.text_aligner, mels, mel_input_length, texts, n_down, aligner_bucket_frames
+                    )
 
                     s2s_attn = s2s_attn.transpose(-1, -2)
                     s2s_attn = s2s_attn[..., 1:]

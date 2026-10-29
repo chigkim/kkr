@@ -489,6 +489,7 @@ def main(config_path, dataset, name, resume):
     if fixed_training_mel_len:
         log_info(f"Using fixed Stage 2 training mel length: {fixed_training_mel_len_frames} frames")
     fixed_mps_text_length = int(config.get('fixed_mps_text_length', 0) or 0)
+    aligner_bucket_frames = int(config.get('aligner_bucket_frames', 64))
     fixed_mps_mel_length = int(config.get('fixed_mps_mel_length', 0) or 0)
     mps_safe_gather_crop = bool(config.get('mps_safe_gather_crop', device == 'mps'))
     style_ref_crop_frames = int(config.get('style_ref_crop_frames', 0) or 0)
@@ -904,15 +905,16 @@ def main(config_path, dataset, name, resume):
                     ref_mels = ref_mels[keep_idx]
 
             with torch.no_grad():
-                aligner_width = aligner_mels.size(2) // (2**n_down)
-                mask = _length_to_width_mask(aligner_mel_input_length // (2**n_down), aligner_width).to(aligner_device)
                 text_mask = _length_to_text_mask(input_lengths, texts.size(1)).to(texts.device)
 
                 try:
-                    _, _, s2s_attn = model.text_aligner(
+                    _, s2s_attn = run_text_aligner(
+                        model.text_aligner,
                         aligner_mels.detach(),
-                        mask,
+                        aligner_mel_input_length,
                         aligner_texts,
+                        n_down,
+                        aligner_bucket_frames,
                     )
                     s2s_attn = s2s_attn.transpose(-1, -2)
                     s2s_attn = s2s_attn[..., 1:]
@@ -1485,17 +1487,15 @@ def main(config_path, dataset, name, resume):
                     ) = batch
                     with torch.no_grad():
                         aligner_mels = mels.detach().to(val_aligner_device)
-                        aligner_width = aligner_mels.size(2) // (2**n_down)
-                        mask = _length_to_width_mask(
-                            mel_input_length.to(val_aligner_device) // (2**n_down),
-                            aligner_width,
-                        ).to(val_aligner_device)
                         text_mask = _length_to_text_mask(input_lengths, texts.size(1)).to(texts.device)
 
-                        _, _, s2s_attn = model.text_aligner(
+                        _, s2s_attn = run_text_aligner(
+                            model.text_aligner,
                             aligner_mels,
-                            mask,
+                            mel_input_length.to(val_aligner_device),
                             texts.to(val_aligner_device),
+                            n_down,
+                            aligner_bucket_frames,
                         )
                         s2s_attn = s2s_attn.transpose(-1, -2)
                         s2s_attn = s2s_attn[..., 1:]
