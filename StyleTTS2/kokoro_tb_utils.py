@@ -60,10 +60,13 @@ def prepare_test_tokens(text_cleaner):
     return result
 
 
-def extract_voicepack(model, root_path, device, n_samples=200):
+def extract_voicepack(model, root_path, device, n_samples=200, speaker=None):
     """Extract a mini voicepack from audio files — mirrors extract_voicepack.py.
 
-    Randomly samples up to n_samples WAV files from root_path, computes
+    Uses one speaker (WAV parent folder; default: the speaker with the most
+    files) so the preview is a real voice, not an average across speakers.
+    Samples up to n_samples of its files with a fixed seed, so every epoch
+    uses the same references. Computes
     mel spectrograms with the same params as meldataset.py, runs them through
     model.style_encoder and model.predictor_encoder, and averages the results.
 
@@ -87,8 +90,18 @@ def extract_voicepack(model, root_path, device, n_samples=200):
         logger.warning(f"extract_voicepack: no WAV files found in {root_path}")
         return None, 0.0, 0.0
 
-    random.shuffle(wav_files)
+    by_speaker = {}
+    for wav_path in wav_files:
+        by_speaker.setdefault(wav_path.parent.name, []).append(wav_path)
+    if speaker is None:
+        speaker = max(sorted(by_speaker), key=lambda k: len(by_speaker[k]))
+    if speaker not in by_speaker:
+        logger.warning(f"extract_voicepack: speaker {speaker} not found in {root_path}")
+        return None, 0.0, 0.0
+    wav_files = sorted(by_speaker[speaker])
+    random.Random(0).shuffle(wav_files)
     wav_files = wav_files[:n_samples]
+    logger.info(f"extract_voicepack: speaker {speaker}, {len(wav_files)} files")
 
     acoustic_styles = []
     prosodic_styles = []

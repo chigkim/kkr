@@ -59,7 +59,7 @@ from models import *
 from losses import *
 from utils import *
 
-from Modules.slmadv import SLMAdversarialLoss, mem_diag as slmadv_mem_diag
+from Modules.slmadv import SLMAdversarialLoss
 from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
 
 from optimizers import build_optimizer
@@ -1259,9 +1259,7 @@ def main(config_path, dataset, name, resume):
 
                 # SLM generator loss
                 optimizer.zero_grad()
-                slmadv_mem_diag.start()
                 loss_gen_lm.backward()
-                slmadv_mem_diag.mark('gen_lm_backward')
 
                 # compute the gradient norm
                 total_norm = {}
@@ -1302,7 +1300,6 @@ def main(config_path, dataset, name, resume):
                 optimizer.step("predictor")
                 if diffusion_enabled:
                     optimizer.step("diffusion")
-                slmadv_mem_diag.mark('gen_lm_opt_steps')
 
                 # SLM discriminator loss
                 if d_loss_slm != 0:
@@ -1312,7 +1309,6 @@ def main(config_path, dataset, name, resume):
                     # unnecessary and can accumulate MPS unified memory.
                     d_loss_slm.backward()
                     optimizer.step("wd")
-                    slmadv_mem_diag.mark('disc_slm_backward')
 
                 d_loss_slm_value = (
                     d_loss_slm.item() if torch.is_tensor(d_loss_slm) else d_loss_slm
