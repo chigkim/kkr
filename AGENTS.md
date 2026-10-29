@@ -41,6 +41,43 @@ To validate training/inference changes, use:
 
 - Smoke training runs in `StyleTTS2/`
 - `scripts/test_inference.py` for checkpoint conversion + inference checks
+- `scripts/speaker_similarity.py` and `scripts/compare_similarity.py` for voice identity (see Experiments below)
+
+A smoke run shows that the code runs, not that a long MPS run stays within memory.
+
+## Experiments, handoff and other agents
+
+### Handoff journal
+
+`.agent-work/handoff/HANDOFF.md` is the working record of experiments and the state of the project. `.agent-work/` is excluded from git (in `.git/info/exclude`), so the file exists only on this machine and is never committed. Read it before starting work, and update it as you go, not only at the end.
+
+- Part 1, the master plan (goal, current status, open questions Q-n, experiment queue X-n, decisions pending, risks), is revised in place so it always shows the current state.
+- Part 2, the journal, is append-only. Add a new `## J-n. DATE TIME — title` entry at the end for each event: a run launched or finished, a result, a decision, an advisor consultation, a correction.
+- Never rewrite or delete an old journal entry. When one turns out wrong, add a new entry with the correction and mark the old entry "Corrected in J-m" in its title.
+- In every entry, keep observed results, inferences and guesses visibly apart, and keep contradictory evidence.
+- `.agent-work/handoff/review-status.md` tracks review findings and session ids. `.agent-work/jobs/<name>/` holds the task and response files of advisor consultations.
+
+### Conducting an experiment
+
+- Give each experiment a row in the queue: the question it answers, the procedure, and the pass criterion. Write the criterion and a prediction into the journal before the run. If the criterion changes after any data are seen, record that and why.
+- Compare against a baseline scored with the same evaluation code, seeds and real recordings. For voice identity, score seeds 0, 1 and 2, pass the baseline's `results.json` to `speaker_similarity.py --real-files-from`, and decide with `compare_similarity.py`. When the evaluation script changes, rescore the baseline too.
+- Change one thing per experiment where possible, and state any confound (different training length, batch size or commit) in the queue row.
+- Use `--name` for new runs. Use `--resume` only to continue the same stage. Start Stage 2 fresh with `--name`.
+- Only one MPS training job runs at a time. Never touch a running run's directory, config or `run.sh`, and never rerun a run's `run.sh` to recover it, because it restarts Stage 1 from scratch.
+- CPU jobs beside a training run slow it by about 20%. Use `OMP_NUM_THREADS=4`, run one CPU job at a time, and watch the training step time.
+- Copy a checkpoint before scoring it if training may overwrite it (`best_*.pth`, pruned `epoch_*.pth`).
+- Monitor MPS memory with `torch.mps.current_allocated_memory()`, `driver_allocated_memory()` and `recommended_max_memory()`. The generic `torch.accelerator.memory.*` APIs fail on MPS.
+- Ask the user before changing the training recipe of a planned run, before deleting run artifacts, and before pushing.
+
+### Working with other agents
+
+The lead agent runs the experiment and makes the decisions. Other models are consulted with `lmg ask`, which runs a task folder containing `task.md` and writes `responseN.md` there (see the `lmg-ask` skill). Run it from the repo root.
+
+- Codex is the second opinion and code reviewer: `lmg ask codex read .agent-work/jobs/<name> [SESSION] --reasoning high`. It is cheap; use it first for anything code or data can settle.
+- Fable 5.1 is the advisor for major decisions: `lmg ask claude read .agent-work/jobs/<name> [SESSION] --model claude-fable-5-1 --reasoning high`. It has a weekly cap as well as the 5-hour window, so consult it about once per experiment phase, with one focused question. Without `--model`, `lmg ask claude` runs Opus, not Fable.
+- Check the budget and reset times before each call. They are in the usage table that ends each `lmg ask` run, or in `lmg usage`. If the "Claude Fable week" row is missing, rerun `lmg usage` before concluding that the budget is unknown.
+- Pass a session id to continue an earlier consultation, so the agent keeps its context. Use `read` unless the agent is meant to edit files.
+- Verify every claim against code or data before acting on it. Record each consultation in the journal: what was asked, the answer file, what was adopted and what was rejected, and why.
 
 ## CLI Usage
 

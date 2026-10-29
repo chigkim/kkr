@@ -110,7 +110,7 @@ loss_params:
   lambda_F0: 1.0                    # F0 (pitch) prediction loss
   lambda_norm: 1.0                  # energy/norm prediction loss
   lambda_s2s: 1.0                   # sequence-to-sequence loss
-  lambda_mono: 0.5                  # monotonic alignment loss; averaged over valid cells, so 0.5 matches upstream's padded-grid mean at batch size 8 (about 47% of cells valid)
+  lambda_mono: 0.5                  # monotonic alignment loss, averaged over valid cells; upstream averages over a padded grid that is about 70% valid at batch 8 on dataset/train.txt (measured 2026-10-29), so ~0.7 would match upstream's 1.0 and 0.5 is ~30% weaker
   lambda_slm: 1.0                   # WavLM perceptual loss
   slmadv_enabled: false             # off: WavLM grad-forward in slmadv generator leaks on MPS (~2.5 GB/epoch in-section); root-causing via standalone repro
   lambda_diff: 0.0                  # diffusion loss (0 = disabled, no diffusion)
