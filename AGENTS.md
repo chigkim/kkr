@@ -77,7 +77,7 @@ You are an autonomous agent. Once given a goal or task, work toward it persisten
 - Only one MPS training job runs at a time. Never touch a running run's directory, config or `run.sh`, and never rerun a run's `run.sh` to recover it, because it restarts Stage 1 from scratch.
 - CPU jobs beside a training run slow it by about 20%. Use `OMP_NUM_THREADS=4`, run one CPU job at a time, and watch the training step time.
 - Copy a checkpoint before scoring it if training may overwrite it (`best_*.pth`, pruned `epoch_*.pth`).
-- Monitor MPS memory with `torch.mps.current_allocated_memory()`, `driver_allocated_memory()` and `recommended_max_memory()`. The generic `torch.accelerator.memory.*` APIs fail on MPS.
+- Monitor MPS memory with `torch.mps.current_allocated_memory()`, `driver_allocated_memory()` and `recommended_max_memory()`. Since torch 2.15 the generic `torch.accelerator` memory APIs also work on MPS, but they have no equivalent of `driver_allocated_memory()`, which is the figure memory decisions use. Keep `torch.mps.empty_cache()` on MPS (see `_empty_accelerator_cache()` in `train_*.py`); it has not been confirmed that the generic `empty_cache()` also clears the MPSGraph cache.
 - Ask the user before changing the training recipe of a planned run, before deleting run artifacts, and before pushing.
 
 ### Working with other agents

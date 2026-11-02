@@ -212,6 +212,20 @@ def _gb(value):
     return float(value) / 1024 ** 3
 
 
+def _empty_accelerator_cache(device):
+    '''Collect garbage and release cached accelerator memory.
+
+    MPS keeps torch.mps.empty_cache(): since PyTorch 2.13 (PR #181485) it also
+    clears the MPSGraph cache, and that has not been confirmed for the generic
+    torch.accelerator.empty_cache().
+    '''
+    gc.collect()
+    if device == 'mps':
+        torch.mps.empty_cache()
+    elif device != 'cpu':
+        torch.accelerator.empty_cache()
+
+
 def _torch_memory_report_line(device):
     if device == 'mps' and torch.backends.mps.is_available():
         try:
@@ -221,15 +235,16 @@ def _torch_memory_report_line(device):
             return 'MPS: cur=%.2f drv=%.2f max=%.2f' % (_gb(current), _gb(driver), _gb(recommended))
         except Exception as exc:
             return f'MPS mem unavailable: {type(exc).__name__}'
-    if device == 'cuda' and torch.cuda.is_available():
+    if device != 'cpu' and torch.accelerator.is_available():
         try:
-            return 'CUDA alloc=%.2f reserved=%.2f max=%.2f' % (
-                _gb(torch.cuda.memory_allocated()),
-                _gb(torch.cuda.memory_reserved()),
-                _gb(torch.cuda.max_memory_allocated()),
+            return '%s alloc=%.2f reserved=%.2f max=%.2f' % (
+                device.upper(),
+                _gb(torch.accelerator.memory_allocated()),
+                _gb(torch.accelerator.memory_reserved()),
+                _gb(torch.accelerator.max_memory_allocated()),
             )
         except Exception as exc:
-            return f'CUDA mem unavailable: {type(exc).__name__}'
+            return f'{device.upper()} mem unavailable: {type(exc).__name__}'
     return 'torch_mem=n/a'
 
 
@@ -633,8 +648,7 @@ def main(config_path, dataset, name, resume):
     epoch_durations = []
     for epoch in range(start_epoch, epochs):
         if device == "mps":
-            gc.collect()
-            torch.mps.empty_cache()
+            _empty_accelerator_cache(device)
         running_loss = 0
         running_steps = 0
         skipped_short_batches = 0
@@ -865,8 +879,7 @@ def main(config_path, dataset, name, resume):
                 and mps_cache_interval > 0
                 and (i + 1) % mps_cache_interval == 0
             ):
-                gc.collect()
-                torch.mps.empty_cache()
+                _empty_accelerator_cache(device)
 
             iters = iters + 1
 
