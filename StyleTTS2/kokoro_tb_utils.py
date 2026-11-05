@@ -72,6 +72,7 @@ def extract_voicepack(model, root_path, device, n_samples=200, speaker=None):
         n_mels=80,
     ).to(device)
     mel_mean, mel_std = -4, 4
+    model = _unwrap_ddp(model)
 
     wav_files = list(Path(root_path).rglob("*.wav"))
     if not wav_files:
@@ -132,6 +133,11 @@ def extract_voicepack(model, root_path, device, n_samples=200, speaker=None):
     return voicepack.to(device), acoustic_norm, prosodic_norm
 
 
+def _unwrap_ddp(model):
+    # Plain modules for rank-0-only inference: no DDP attribute errors, no DDP collectives.
+    return type(model)({k: getattr(v, 'module', v) for k, v in model.items()})
+
+
 def _medoid(styles):
     """The per-utterance style closest to the mean of `styles` ([1, D] each)."""
     M = torch.cat(styles, dim=0)
@@ -151,6 +157,7 @@ def run_kokoro_inference(model, test_tokens, voicepack, device, text_cleaner):
     """
     if voicepack is None or not test_tokens:
         return []
+    model = _unwrap_ddp(model)
 
     # voicepack [256]: first 128 = acoustic (decoder), last 128 = prosodic (predictor)
     ref_acoustic = voicepack[:128].unsqueeze(0)  # [1, 128]

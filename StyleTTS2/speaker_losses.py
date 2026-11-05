@@ -55,8 +55,10 @@ def speaker_separation_loss(
         center = F.mse_loss(style, target)
         loss = loss + lambda_center * center
 
-    if centers is not None and lambda_margin > 0 and centers.weight.shape[0] > 1:
-        normalized = F.normalize(centers.weight, dim=-1)
+    # DDP wraps modules; attribute access must go through .module.
+    center_weight = getattr(centers, 'module', centers).weight if centers is not None else None
+    if center_weight is not None and lambda_margin > 0 and center_weight.shape[0] > 1:
+        normalized = F.normalize(center_weight, dim=-1)
         distances = torch.cdist(normalized, normalized, p=2)
         mask = ~torch.eye(distances.shape[0], dtype=torch.bool, device=distances.device)
         margin_loss = F.relu(margin - distances[mask]).mean()
