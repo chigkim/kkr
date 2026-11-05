@@ -59,7 +59,7 @@ import time
 from tqdm import tqdm
 
 from accelerate import Accelerator
-from accelerate.utils import LoggerType
+from accelerate.utils import DataLoaderConfiguration, LoggerType
 from accelerate import DistributedDataParallelKwargs
 
 from torch.utils.tensorboard import SummaryWriter
@@ -378,7 +378,11 @@ def main(config_path, dataset, name, resume):
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
-        project_dir=log_dir, split_batches=True, kwargs_handlers=[ddp_kwargs]
+        # batch_size is the global batch, split across GPUs. accelerate 1.x ignores Accelerator(split_batches=True);
+        # it must go through DataLoaderConfiguration, or each GPU gets the full batch.
+        project_dir=log_dir,
+        dataloader_config=DataLoaderConfiguration(split_batches=True),
+        kwargs_handlers=[ddp_kwargs],
     )
     if accelerator.is_main_process:
         writer = SummaryWriter(log_dir + "/tensorboard")
