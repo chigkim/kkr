@@ -530,6 +530,12 @@ def main(config_path, dataset, name, resume):
     loss_test_record = list([])
 
     TMA_epoch = loss_params.TMA_epoch
+    # Decoder warm-up: for the first N epochs the decoder gets no optimizer step (weights stay at the loaded
+    # checkpoint) while the style encoder, text modules, timbre heads and critics train as usual. The LR is
+    # constant (OneCycleLR with div factors 1, never stepped), so later decoder updates are unaffected.
+    freeze_decoder_epochs = int(config.get("freeze_decoder_epochs", 0))
+    if freeze_decoder_epochs:
+        log_info(f"Decoder frozen (no optimizer step) for epochs < {freeze_decoder_epochs}")
 
     for k in model:
         model[k] = accelerator.prepare(model[k])
@@ -867,7 +873,8 @@ def main(config_path, dataset, name, resume):
 
             optimizer.step("text_encoder")
             optimizer.step("style_encoder")
-            optimizer.step("decoder")
+            if epoch >= freeze_decoder_epochs:
+                optimizer.step("decoder")
             if 'timbre_speaker_classifier' in model:
                 optimizer.step("timbre_speaker_classifier")
             if 'timbre_speaker_centers' in model:
