@@ -547,9 +547,16 @@ def main(config_path, dataset, name, resume):
     _ = [model[key].to(device) for key in model]
 
     # initialize optimizers after preparing models for compatibility with FSDP
+    scheduler_params_dict = {key: scheduler_params.copy() for key in model}
+    # Optional decoder-only learning rate. OneCycleLR with div factors 1 sets the optimizer's lr to max_lr at
+    # construction, so overriding max_lr is enough; the other modules keep optimizer_params.lr.
+    decoder_lr = config.get("decoder_lr")
+    if decoder_lr is not None:
+        scheduler_params_dict['decoder']['max_lr'] = float(decoder_lr)
+        log_info(f"Decoder learning rate {float(decoder_lr):g} (other modules {scheduler_params['max_lr']:g})")
     optimizer = build_optimizer(
         {key: model[key].parameters() for key in model},
-        scheduler_params_dict={key: scheduler_params.copy() for key in model},
+        scheduler_params_dict=scheduler_params_dict,
         lr=float(config["optimizer_params"].get("lr", 1e-4)),
     )
 
