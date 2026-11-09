@@ -536,6 +536,12 @@ def main(config_path, dataset, name, resume):
     freeze_decoder_epochs = int(config.get("freeze_decoder_epochs", 0))
     if freeze_decoder_epochs:
         log_info(f"Decoder frozen (no optimizer step) for epochs < {freeze_decoder_epochs}")
+    # X23: keep the decoder's waveform generator at the loaded weights for the whole run. Gradients still flow
+    # through it to the decoder front end and style encoder; its parameters get no grad, so AdamW (incl. weight
+    # decay) skips them. Set before accelerator.prepare so DDP excludes them; load_state_dict keeps the flag.
+    if config.get("freeze_generator", False):
+        model.decoder.generator.requires_grad_(False)
+        log_info("Decoder generator frozen for the whole run (freeze_generator)")
 
     for k in model:
         model[k] = accelerator.prepare(model[k])
