@@ -741,6 +741,12 @@ def main(config_path, dataset, name, resume):
         # (load_checkpoint sets them to eval(), which breaks spectral_norm)
         _set_train_mode(model)
 
+    # X23/X24: keep the decoder's waveform generator at the loaded weights (Stage 1 with freeze_generator leaves it
+    # at base). Gradients still flow through it; its parameters get no grad, so AdamW (incl. weight decay) skips them.
+    if config.get("freeze_generator", False):
+        model.decoder.generator.requires_grad_(False)
+        log_info("Decoder generator frozen for the whole run (freeze_generator)")
+
     # DP — must happen AFTER load_checkpoint so state dict keys match
     # (DataParallel adds 'module.' prefix which breaks strict=False loading)
     if device == "cuda":
