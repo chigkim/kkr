@@ -80,6 +80,39 @@ You are an autonomous agent. Once given a goal or task, work toward it persisten
 - Monitor MPS memory with `torch.mps.current_allocated_memory()`, `driver_allocated_memory()` and `recommended_max_memory()`. Since torch 2.15 the generic `torch.accelerator` memory APIs also work on MPS, but they have no equivalent of `driver_allocated_memory()`, which is the figure memory decisions use. Keep `torch.mps.empty_cache()` on MPS (see `_empty_accelerator_cache()` in `train_*.py`); it has not been confirmed that the generic `empty_cache()` also clears the MPSGraph cache.
 - Ask the user before changing the training recipe of a planned run, before deleting run artifacts, and before pushing.
 
+### Listening tests
+
+Listening tests judge bubbles and grain in /s/ and other sibilants. Speaker identity is judged by the automatic score (see Conducting an experiment), not by ear. Results come from one listener, so report them as such.
+
+Before building the set:
+
+- Write the pass rule and a prediction into the journal before any audio from the new model is heard.
+- Pick sentences the user has not heard: exclude every earlier set under `.agent-work/listen/` and the `val22` identity list. Take validation sentences with at least two s/z/sh/zh phonemes.
+- Every clip must be at least 5 seconds long; 6 to 10 seconds is better. VCTK clips average about 3.6 seconds and only about 10% reach 5 seconds, so join two or more sentences from the same speaker back to back, with no added pause (each sentence already starts and ends with silence).
+- All versions of an item use the same sentences. Stock Kokoro speaks faster than the recordings, so check every version's length; if one is under 5 seconds, replace the whole item with the next speaker.
+- Use about 10 items. Versions are usually the real recording, stock Kokoro (official voice of the same gender), the control model and the test model.
+
+Building the set (example scripts: `.agent-work/jobs/x23/`):
+
+- Present every rated clip as a pair. `NNa.wav` is the real recording of the same sentences, unprocessed from the dataset (joined back to back, no loudness change of its own). `NNb.wav` is the clip to rate: stock, control, test model, or the real recording again. The user rates only the `b` clips.
+- In synthesized `b` clips, match each joined sentence in loudness before joining.
+- Within each pair, match integrated loudness (LUFS, ITU-R BS.1770): turn the louder clip down to the quieter one's LUFS and never raise the quieter one. Measure with `pyloudnorm` (`pyloudnorm.Meter(sr).integrated_loudness(x)`); it is a project dependency. Never clip; scale down instead.
+- Include real-vs-real pairs (the `b` clip is the real recording) as the clean-audio baseline.
+- Shuffle the pairs with a fixed seed and add 2 hidden repeats of control or test clips in the second half. Write the key to `key.json` and do not read it until the user has rated every clip.
+- Check the shortest clip in the final set before giving it to the user.
+
+Giving the set to the user:
+
+- Before they listen, state the question, the folder, the play order (`01` upward, `a` then `b`) and the rating key. Do not reveal which system any clip is, or any detector score.
+- Rating key: 0 no bubbles, 1 hard to tell, 2 definitely bubbles, 3 very obvious bubbles. Flags: `c` combing, roomy or reverby; `d` distorted; `b` buzzy or tinier bubbles. Ask about any other flag before scoring.
+- The user may rate by renaming files to `NN <rating><flags>.wav`. Save the raw file names to `answers_raw.txt` before reading the key.
+
+Scoring:
+
+- Count none/slight (0 or 1) per system, using the first presentation of each item, and compare test with control per sentence (better, tied, worse; sign test). Report the hidden repeats and the anchors' scores.
+- Apply the preregistered rule as written. Distortion, buzz or zingy grain worse than the control blocks a pass.
+- Log the ratings, the unblinded table and the verdict in the journal.
+
 ### Working with other agents
 
 The lead agent runs the experiment and makes the decisions. Other models are consulted with `lmg ask`, which runs a task folder containing `task.md` and writes `responseN.md` there (see the `lmg-ask` skill). Run it from the repo root.
