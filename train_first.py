@@ -620,6 +620,9 @@ def main(config_path, dataset, name, resume):
 
     # wrapped losses for compatibility with mixed precision
     stft_loss = MultiResolutionSTFTLoss().to(device)
+    # X21: penalty on frame-grid-locked high-band flicker ("bubbles"); off unless lambda_grid > 0
+    lambda_grid = float(loss_params.get("lambda_grid", 0))
+    grid_loss = GridFlickerLoss().to(device) if lambda_grid > 0 else None
     gl = GeneratorLoss(model.mpd, model.msd).to(device)
     dl = DiscriminatorLoss(model.mpd, model.msd).to(device)
     wl = WavLMLoss(model_params.slm.model, model.wd, sr, model_params.slm.sr).to(device)
@@ -842,6 +845,8 @@ def main(config_path, dataset, name, resume):
             # generator loss
             optimizer.zero_grad()
             loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
+            # wav and y_rec start at random_start * 600 samples, i.e. on the decoder's 40 fps frame grid
+            loss_grid = grid_loss(y_rec, wav.detach()) if grid_loss is not None else 0
 
             if epoch >= TMA_epoch:  # start TMA training
                 loss_s2s = _s2s_loss(s2s_pred, texts, input_lengths)
@@ -863,6 +868,7 @@ def main(config_path, dataset, name, resume):
                     + loss_params.lambda_s2s * loss_s2s
                     + loss_params.lambda_gen * loss_gen_all
                     + loss_params.lambda_slm * loss_slm
+                    + lambda_grid * loss_grid
                     + timbre_spk_loss
                 )
 
@@ -871,7 +877,7 @@ def main(config_path, dataset, name, resume):
                 loss_mono = 0
                 loss_gen_all = 0
                 loss_slm = 0
-                g_loss = loss_mel + timbre_spk_loss
+                g_loss = loss_mel + lambda_grid * loss_grid + timbre_spk_loss
 
             running_loss += accelerator.gather(loss_mel).mean().item()
             running_steps += 1
@@ -924,7 +930,7 @@ def main(config_path, dataset, name, resume):
                 elapsed = _format_elapsed(time.time() - start_time)
                 memory_line = _torch_memory_report_line(device)
                 step_message = (
-                    "Step %d/%d: Mel=%.2f Gen=%.2f Disc=%.2f Mono=%.2f S2S=%.2f SLM=%.2f TimbreCE=%.2f TimbreCenter=%.2f SpkMargin=%.2f Elapsed=%s\n%s"
+                    "Step %d/%d: Mel=%.2f Gen=%.2f Disc=%.2f Mono=%.2f S2S=%.2f SLM=%.2f Grid=%.4f TimbreCE=%.2f TimbreCenter=%.2f SpkMargin=%.2f Elapsed=%s\n%s"
                     % (
                         i + 1,
                         len(train_dataloader),
@@ -934,6 +940,7 @@ def main(config_path, dataset, name, resume):
                         loss_mono,
                         loss_s2s,
                         loss_slm,
+                        scalar_value(loss_grid),
                         timbre_spk_ce,
                         timbre_center_loss,
                         timbre_margin_loss,
@@ -964,6 +971,7 @@ def main(config_path, dataset, name, resume):
                 writer.add_scalar("train/mono_loss", loss_mono, iters)
                 writer.add_scalar("train/s2s_loss", loss_s2s, iters)
                 writer.add_scalar("train/slm_loss", loss_slm, iters)
+                writer.add_scalar("train/grid_loss", scalar_value(loss_grid), iters)
                 writer.add_scalar("train/timbre_spk_ce", timbre_spk_ce, iters)
                 writer.add_scalar("train/timbre_center_loss", timbre_center_loss, iters)
                 writer.add_scalar("train/speaker_margin_loss", timbre_margin_loss, iters)

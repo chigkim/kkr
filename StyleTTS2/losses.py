@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -324,3 +326,79 @@ class WavLMLoss(torch.nn.Module):
         y_d_rs = self.wd(y_embeddings)
 
         return y_d_rs.to(out_device)
+
+
+class GridFlickerLoss(torch.nn.Module):
+    '''Penalise high-band level flicker locked to the decoder's frame grid (X21, J-305).
+
+    The ISTFTNet decoder runs at 40 fps (600 samples) before its last block and 80 fps after it. Fine-tuned
+    generators imprint that grid on fricative noise as phase-coherent 40/80/120/160 Hz modulation of the
+    4-10 kHz log envelope ("bubbles"). For each carrier bin the log envelope of every active 600-sample cycle
+    is projected onto the cycle's harmonics 1..4 and averaged across cycles; the squared magnitude of that
+    average is the grid-coherent power. The loss is relu(power(y_rec) - power(wav)), so a crop is penalised only
+    for flicker beyond the real recording's. Cycles are gated on the real crop (high-band share and level).
+    Crops must start on the 600-sample grid (train_first.py crops at multiples of 600).
+    '''
+
+    def __init__(self, sr=24000, n_fft=128, hop=24, period=600, f_lo=4000.0, f_hi=10000.0, harmonics=4,
+                 share_min=0.25, range_db=35.0, floor_db=-30.0):
+        super().__init__()
+        assert period % hop == 0
+        self.n_fft, self.hop, self.period, self.k = n_fft, hop, period, period // hop
+        self.share_min, self.range = share_min, 10 ** (-range_db / 10)
+        self.floor_rel = 10 ** (floor_db / 10)
+        f = torch.fft.rfftfreq(n_fft, 1 / sr)
+        self.register_buffer('band', (f >= f_lo) & (f <= f_hi), persistent=False)
+        self.register_buffer('hf', f >= f_lo, persistent=False)
+        self.register_buffer('window', torch.hann_window(n_fft), persistent=False)
+        # frame t of a cycle is centred at sample t*hop + n_fft/2 inside the cycle
+        ph = 2 * math.pi * torch.arange(1, harmonics + 1)[:, None] * (torch.arange(self.k) * hop + n_fft / 2) / period
+        self.register_buffer('cos', torch.cos(ph).T / self.k, persistent=False)   # [k, H]
+        self.register_buffer('sin', torch.sin(ph).T / self.k, persistent=False)
+
+    def _power(self, x):
+        n = (x.size(-1) // self.period) * self.period
+        x = x[..., :n]
+        # center=False: frame t starts at sample t*hop, so its phase in the cycle is explicit; no padding, so
+        # the last partial cycle is dropped rather than filled with zeros
+        S = torch.stft(x, self.n_fft, self.hop, window=self.window, center=False, return_complex=True)
+        return S.real ** 2 + S.imag ** 2  # [B, F, frames]
+
+    def forward(self, y_rec, wav):
+        y_rec = y_rec.reshape(y_rec.size(0), -1).float()
+        wav = wav.reshape(wav.size(0), -1).float()
+        P = self._power(y_rec)
+        with torch.no_grad():
+            Q = self._power(wav)
+        B, C = y_rec.size(0), (min(P.size(-1), Q.size(-1)) // self.k)
+        P, Q = P[..., :C * self.k], Q[..., :C * self.k]
+        with torch.no_grad():
+            tot = Q.sum(1).view(B, C, self.k).mean(-1)                       # [B, C]
+            hfp = Q[:, self.hf].sum(1).view(B, C, self.k).mean(-1)
+            gate = (hfp / tot.clamp_min(1e-12) > self.share_min) & (tot > tot.amax(1, keepdim=True) * self.range)
+            g = gate.float()
+            n = g.sum(1).clamp_min(1)                                         # active cycles per crop
+
+            # floor relative to the real crop's band level: keeps log() and its gradient bounded in near-silent bins
+            floor = (Q[:, self.band].mean((1, 2)) * self.floor_rel).clamp_min(1e-10)[:, None, None]
+
+        def coherent(Pw):
+            d = torch.log(Pw[:, self.band] + floor).view(B, -1, C, self.k)            # [B, bins, C, k]
+            d = d - d.mean(-1, keepdim=True)
+            zr, zi = d @ self.cos, d @ self.sin                                       # [B, bins, C, H]
+            zr = (zr * g[:, None, :, None]).sum(2) / n[:, None, None]
+            zi = (zi * g[:, None, :, None]).sum(2) / n[:, None, None]
+            return (zr ** 2 + zi ** 2).sum(-1).mean(-1)                               # [B]
+
+        with torch.no_grad():
+            ref = coherent(Q)
+        gen = coherent(P)
+        use = (g.sum(1) >= 4).float()                                                 # need a few active cycles
+        num, cnt = (F.relu(gen - ref) * use).sum(), use.sum().detach()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            # DDP averages gradients over ranks; normalise by the global eligible-crop count so the result
+            # equals the mean over eligible crops of the whole batch (Codex x21 review)
+            cnt = cnt.clone()
+            torch.distributed.all_reduce(cnt)
+            return torch.distributed.get_world_size() * num / cnt.clamp_min(1)
+        return num / cnt.clamp_min(1)
